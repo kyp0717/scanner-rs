@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use ratatui::Terminal;
 use tracing::info;
 
 use crate::config::SupabaseConfig;
-use crate::enrichment::enrich_results;
+use crate::enrichment::{fetch_enrichment, EnrichmentData};
 use crate::history::SupabaseClient;
 use crate::models::*;
 use crate::tws;
@@ -40,6 +40,29 @@ pub enum BgMessage {
         symbol_scanners: HashMap<String, Vec<String>>,
         port: Option<u16>,
     },
+    EnrichComplete {
+        symbol: String,
+        data: EnrichmentData,
+    },
+}
+
+/// Request to enrich a symbol, ordered by scanner_hits (higher = higher priority).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EnrichRequest {
+    pub symbol: String,
+    pub scanner_hits: u32,
+}
+
+impl Ord for EnrichRequest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.scanner_hits.cmp(&other.scanner_hits)
+    }
+}
+
+impl PartialOrd for EnrichRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Application state for the TUI.
@@ -64,10 +87,11 @@ pub struct App {
     pub bg_tx: mpsc::Sender<BgMessage>,
     pub bg_rx: mpsc::Receiver<BgMessage>,
     pub bg_busy: bool,
+    pub enrich_tx: mpsc::Sender<EnrichRequest>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(enrich_tx: mpsc::Sender<EnrichRequest>) -> Self {
         let (bg_tx, bg_rx) = mpsc::channel();
         Self {
             settings: Settings::default(),
@@ -90,7 +114,16 @@ impl App {
             bg_tx,
             bg_rx,
             bg_busy: false,
+            enrich_tx,
         }
+    }
+
+    /// Queue enrichment for a symbol if the channel is available.
+    fn queue_enrich(&self, symbol: &str, scanner_hits: u32) {
+        let _ = self.enrich_tx.send(EnrichRequest {
+            symbol: symbol.to_string(),
+            scanner_hits,
+        });
     }
 
     fn update_title(&mut self) {
@@ -179,7 +212,7 @@ impl App {
         }
     }
 
-    fn cmd_scan(&mut self, args: &[&str], rt: &tokio::runtime::Handle) {
+    fn cmd_scan(&mut self, args: &[&str], _rt: &tokio::runtime::Handle) {
         if args.is_empty() {
             self.push_output("Usage: scan <alias|code> [--rows N] [--min-price N] [--max-price N]");
             return;
@@ -230,14 +263,10 @@ impl App {
             .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
         let host = self.settings.host.clone();
         let tx = self.bg_tx.clone();
-        let rt_handle = rt.clone();
         let code = scanner_code.clone();
 
         std::thread::spawn(move || {
-            let (mut results, port) = tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
-            if !results.is_empty() {
-                rt_handle.block_on(async { enrich_results(&mut results).await });
-            }
+            let (results, port) = tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
             let _ = tx.send(BgMessage::ScanComplete { scanner_code: code, results, port });
         });
     }
@@ -298,6 +327,11 @@ impl App {
                 let count = self.alert_seen.len();
                 self.alert_seen.clear();
                 self.alert_rows.clear();
+                // Send sentinel to enrichment worker to clear its seen set
+                let _ = self.enrich_tx.send(EnrichRequest {
+                    symbol: String::new(),
+                    scanner_hits: 0,
+                });
                 self.push_output(&format!("Cleared {count} seen symbols and alert table"));
             }
             _ => {
@@ -306,7 +340,7 @@ impl App {
         }
     }
 
-    fn run_poll_scanners(&mut self, rt: &tokio::runtime::Handle) {
+    fn run_poll_scanners(&mut self, _rt: &tokio::runtime::Handle) {
         if self.bg_busy {
             return; // Skip if already busy
         }
@@ -319,7 +353,6 @@ impl App {
             .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
         let host = self.settings.host.clone();
         let tx = self.bg_tx.clone();
-        let rt_handle = rt.clone();
 
         std::thread::spawn(move || {
             let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
@@ -327,12 +360,9 @@ impl App {
             let mut connected_port = None;
 
             for &(code, cid) in ALERT_SCANNERS {
-                let (mut results, port) = tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
+                let (results, port) = tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
                 if connected_port.is_none() {
                     connected_port = port;
-                }
-                if !results.is_empty() {
-                    rt_handle.block_on(async { enrich_results(&mut results).await });
                 }
 
                 for r in results {
@@ -391,6 +421,10 @@ impl App {
                     self.push_output(&format!("\nTotal: {} stocks", results.len()));
                     let now = chrono::Local::now().format("%H:%M:%S");
                     self.alert_line = format!("[{now}] {scanner_code} -- {} results", results.len());
+                    // Queue enrichment for scan results
+                    for r in &results {
+                        self.queue_enrich(&r.symbol, 1);
+                    }
                 }
             }
             BgMessage::ListComplete { xml, group } => {
@@ -503,14 +537,19 @@ impl App {
                                 last: r.last,
                                 change_pct: r.change_pct,
                                 volume: r.volume,
-                                rvol: r.rvol,
-                                float_shares: r.float_shares,
-                                short_pct: r.short_pct,
-                                name: r.name.clone(),
-                                sector: r.sector.clone(),
-                                catalyst: r.catalyst.clone(),
+                                rvol: None,
+                                float_shares: None,
+                                short_pct: None,
+                                name: None,
+                                sector: None,
+                                industry: None,
+                                catalyst: None,
                                 scanner_hits: hits,
+                                news_headlines: Vec::new(),
+                                enriched: false,
+                                avg_volume: None,
                             });
+                            self.queue_enrich(sym, hits);
                         }
                     }
 
@@ -543,6 +582,37 @@ impl App {
                     }
                 }
 
+            }
+            BgMessage::EnrichComplete { symbol, data } => {
+                // Do NOT toggle bg_busy — enrichment is independent
+                // Update Supabase with enrichment data
+                if let Some(ref mut db) = self.db {
+                    let supa_data = serde_json::json!({
+                        "name": &data.name,
+                        "sector": &data.sector,
+                        "catalyst": &data.catalyst,
+                        "float_shares": data.float_shares,
+                    });
+                    let batch: HashMap<String, (serde_json::Value, Vec<String>)> =
+                        [(symbol.clone(), (supa_data, vec![]))].into_iter().collect();
+                    let _ = rt.block_on(db.record_stocks_batch(&batch));
+                }
+                if let Some(row) = self.alert_rows.iter_mut().find(|r| r.symbol == symbol) {
+                    row.name = data.name;
+                    row.sector = data.sector;
+                    row.industry = data.industry;
+                    row.float_shares = data.float_shares;
+                    row.short_pct = data.short_pct;
+                    row.catalyst = data.catalyst;
+                    row.news_headlines = data.news_headlines;
+                    row.avg_volume = data.avg_volume;
+                    if let (Some(vol), Some(avg)) = (row.volume, data.avg_volume) {
+                        if avg > 0 {
+                            row.rvol = Some(vol as f64 / avg as f64);
+                        }
+                    }
+                    row.enriched = true;
+                }
             }
         }
     }
@@ -706,8 +776,11 @@ pub fn run_tui() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Create enrichment worker
+    let (enrich_tx, enrich_rx) = mpsc::channel::<EnrichRequest>();
+
     // Create app
-    let mut app = App::new();
+    let mut app = App::new(enrich_tx);
 
     // Try to connect to Supabase
     crate::config::load_env();
@@ -731,6 +804,64 @@ pub fn run_tui() -> Result<()> {
 
     app.update_title();
 
+    // Spawn enrichment worker thread
+    {
+        let bg_tx = app.bg_tx.clone();
+        let rt_handle = handle.clone();
+        std::thread::spawn(move || {
+            let client = reqwest::Client::new();
+            let mut heap = BinaryHeap::<EnrichRequest>::new();
+            let mut enriched_set = HashSet::<String>::new();
+
+            loop {
+                // Drain all pending requests into the priority queue
+                loop {
+                    match enrich_rx.try_recv() {
+                        Ok(req) => {
+                            if req.symbol.is_empty() {
+                                // Sentinel: clear enriched set
+                                enriched_set.clear();
+                                heap.clear();
+                                continue;
+                            }
+                            if !enriched_set.contains(&req.symbol) {
+                                heap.push(req);
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                // Process highest-priority item
+                if let Some(req) = heap.pop() {
+                    if enriched_set.contains(&req.symbol) {
+                        continue;
+                    }
+                    enriched_set.insert(req.symbol.clone());
+                    let data = rt_handle.block_on(fetch_enrichment(&client, &req.symbol));
+                    let _ = bg_tx.send(BgMessage::EnrichComplete {
+                        symbol: req.symbol,
+                        data,
+                    });
+                } else {
+                    // Nothing to do — block until a request arrives
+                    match enrich_rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(req) => {
+                            if req.symbol.is_empty() {
+                                enriched_set.clear();
+                            } else if !enriched_set.contains(&req.symbol) {
+                                heap.push(req);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            }
+        });
+    }
+
     // Initialize alerts from today's sightings
     if let Some(ref db) = app.db {
         if let Ok(today) = handle.block_on(db.get_today()) {
@@ -738,6 +869,7 @@ pub fn run_tui() -> Result<()> {
                 app.alert_seen.insert(s.symbol.clone());
                 let scanners_str = &s.scanners;
                 let n_scans = scanners_str.split(',').count() as u32;
+                let has_enrichment = s.name.is_some() || s.catalyst.is_some();
                 app.alert_rows.push(AlertRow {
                     symbol: s.symbol.clone(),
                     alert_time: crate::history::local_time_str(&s.first_seen),
@@ -749,9 +881,16 @@ pub fn run_tui() -> Result<()> {
                     short_pct: None,
                     name: s.name.clone(),
                     sector: s.sector.clone(),
+                    industry: None,
                     catalyst: s.catalyst.clone(),
                     scanner_hits: n_scans,
+                    news_headlines: Vec::new(),
+                    enriched: has_enrichment,
+                    avg_volume: None,
                 });
+                if !has_enrichment {
+                    app.queue_enrich(&s.symbol, n_scans);
+                }
             }
         }
     }
@@ -880,12 +1019,14 @@ mod tests {
     use super::*;
 
     fn new_app() -> App {
-        App::new()
+        let (tx, _rx) = mpsc::channel();
+        App::new(tx)
     }
 
     fn app_with_rt() -> (App, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        (App::new(), rt)
+        let (tx, _rx) = mpsc::channel();
+        (App::new(tx), rt)
     }
 
     #[test]
@@ -1143,6 +1284,36 @@ mod tests {
         let handle = rt.handle().clone();
         app.handle_input("history", &handle);
         assert!(app.output_lines.iter().any(|l| l.contains("Supabase not connected")));
+    }
+
+    #[test]
+    fn test_enrich_request_priority_ordering() {
+        let low = EnrichRequest { symbol: "LOW".to_string(), scanner_hits: 1 };
+        let mid = EnrichRequest { symbol: "MID".to_string(), scanner_hits: 4 };
+        let high = EnrichRequest { symbol: "HIGH".to_string(), scanner_hits: 8 };
+        // Higher scanner_hits = higher priority
+        assert!(high > mid);
+        assert!(mid > low);
+        assert!(high > low);
+
+        // BinaryHeap pops highest first
+        let mut heap = BinaryHeap::new();
+        heap.push(low);
+        heap.push(high);
+        heap.push(mid);
+        assert_eq!(heap.pop().unwrap().symbol, "HIGH");
+        assert_eq!(heap.pop().unwrap().symbol, "MID");
+        assert_eq!(heap.pop().unwrap().symbol, "LOW");
+    }
+
+    #[test]
+    fn test_enrichment_data_news_headlines() {
+        let data = EnrichmentData {
+            news_headlines: vec!["Headline 1".to_string(), "Headline 2".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(data.news_headlines.len(), 2);
+        assert_eq!(data.news_headlines[0], "Headline 1");
     }
 
 }

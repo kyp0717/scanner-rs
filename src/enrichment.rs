@@ -65,6 +65,7 @@ pub struct EnrichmentData {
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
     pub catalyst: Option<String>,
+    pub news_headlines: Vec<String>,
 }
 
 /// Fetch enrichment data for a single symbol.
@@ -91,6 +92,10 @@ pub async fn fetch_enrichment(client: &Client, symbol: &str) -> EnrichmentData {
 
     if let Ok(news) = news_result {
         data.catalyst = classify_catalyst(&news);
+        data.news_headlines = news
+            .iter()
+            .filter_map(|item| item.get("title")?.as_str().map(String::from))
+            .collect();
     } else if let Err(e) = news_result {
         debug!("Yahoo Finance news fetch failed for {symbol}: {e}");
     }

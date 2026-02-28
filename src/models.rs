@@ -39,8 +39,12 @@ pub struct AlertRow {
     pub short_pct: Option<f64>,
     pub name: Option<String>,
     pub sector: Option<String>,
+    pub industry: Option<String>,
     pub catalyst: Option<String>,
     pub scanner_hits: u32,
+    pub news_headlines: Vec<String>,
+    pub enriched: bool,
+    pub avg_volume: Option<i64>,
 }
 
 /// A sighting row from Supabase.
