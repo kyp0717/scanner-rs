@@ -72,7 +72,17 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_main(f: &mut Frame, area: Rect, app: &App) {
     match app.mode {
-        Mode::Alert => draw_alert_table(f, area, app),
+        Mode::Alert => {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(50), // output (left)
+                    Constraint::Percentage(50), // alert table (right)
+                ])
+                .split(area);
+            draw_output(f, chunks[0], app);
+            draw_alert_table(f, chunks[1], app);
+        }
         Mode::Scan => draw_output(f, area, app),
     }
 }
