@@ -107,8 +107,6 @@ list <group>            Fuzzy expand category
 poll                    Show polling status
 poll on|off             Start/stop background momentum polling (60s)
 poll clear              Clear seen-set (re-alert)
-cycle                   Start cycling all 8 scanners (90s)
-cycle stop              Stop cycling
 history                 Show today's tracked stocks
 history all             Show all historical stocks
 history clear           Clear entire history

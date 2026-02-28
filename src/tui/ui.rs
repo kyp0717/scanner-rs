@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
@@ -31,6 +31,7 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )))
+    .alignment(Alignment::Center)
     .style(Style::default().bg(Color::Black));
     f.render_widget(title, area);
 }
