@@ -132,7 +132,7 @@ async fn run_command(cmd: Commands) -> Result<()> {
                 return Ok(());
             }
 
-            let mut results =
+            let (mut results, _port) =
                 tws::run_scan(&scanner_code, &host, &ports, 1, rows, Some(min_price), max_price);
 
             if !results.is_empty() {

@@ -42,30 +42,31 @@ fn draw_alert_line(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let alert = Paragraph::new(Line::from(vec![
-        Span::styled("> alert -- ", Style::default().fg(Color::Cyan)),
-        Span::styled(&app.alert_line, alert_style),
-    ]))
-    .style(Style::default().bg(Color::Black));
+    let alert = Paragraph::new(Line::from(Span::styled(&app.alert_line, alert_style)))
+        .style(Style::default().bg(Color::Black));
     f.render_widget(alert, area);
 }
 
 fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
-    let mode_label = match app.mode {
-        Mode::Alert => "> alert ",
-        Mode::Scan => "> scan  ",
+    let prompt = match app.mode {
+        Mode::Alert => Paragraph::new(Line::from(Span::styled(
+            " Insert=scan  Up/Down=navigate  Esc=back",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .style(Style::default().bg(Color::Black)),
+        Mode::Scan => Paragraph::new(Line::from(vec![
+            Span::styled("> scan  ", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.input),
+        ]))
+        .style(Style::default().bg(Color::Black)),
     };
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled(mode_label, Style::default().fg(Color::Cyan)),
-        Span::raw(&app.input),
-    ]))
-    .style(Style::default().bg(Color::Black));
     f.render_widget(prompt, area);
 
     // Set cursor position in scan mode
     if app.mode == Mode::Scan {
+        let prompt_len = "> scan  ".len();
         f.set_cursor_position((
-            area.x + mode_label.len() as u16 + app.input_cursor as u16,
+            area.x + prompt_len as u16 + app.input_cursor as u16,
             area.y,
         ));
     }

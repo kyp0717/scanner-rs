@@ -31,6 +31,7 @@ pub struct TwsClient {
     writer: BufWriter<TcpStream>,
     state: Arc<Mutex<TwsState>>,
     _reader_handle: std::thread::JoinHandle<()>,
+    pub connected_port: u16,
 }
 
 impl TwsClient {
@@ -45,7 +46,7 @@ impl TwsClient {
                 Duration::from_secs(2),
             ) {
                 Ok(stream) => {
-                    match Self::handshake(stream, client_id) {
+                    match Self::handshake(stream, client_id, port) {
                         Ok(client) => {
                             info!("Connected to TWS on port {port}");
                             println!("Connected to TWS on port {port}");
@@ -67,7 +68,7 @@ impl TwsClient {
         )
     }
 
-    fn handshake(stream: TcpStream, client_id: i32) -> Result<Self> {
+    fn handshake(stream: TcpStream, client_id: i32, port: u16) -> Result<Self> {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let read_stream = stream.try_clone()?;
@@ -140,6 +141,7 @@ impl TwsClient {
             writer,
             state,
             _reader_handle: reader_handle,
+            connected_port: port,
         })
     }
 
@@ -598,7 +600,7 @@ impl TwsClient {
     }
 }
 
-/// Run a scanner subscription and return enriched results.
+/// Run a scanner subscription and return enriched results with the connected port.
 pub fn run_scan(
     scanner_code: &str,
     host: &str,
@@ -607,16 +609,17 @@ pub fn run_scan(
     rows: u32,
     min_price: Option<f64>,
     max_price: Option<f64>,
-) -> Vec<ScanResult> {
+) -> (Vec<ScanResult>, Option<u16>) {
     println!("\nScanning {scanner_code} (rows={rows})...\n");
 
     let mut client = match TwsClient::connect(host, ports, client_id) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
-            return vec![];
+            return (vec![], None);
         }
     };
+    let port = client.connected_port;
 
     // Request delayed frozen data
     if let Err(e) = client.req_market_data_type(4) {
@@ -627,14 +630,14 @@ pub fn run_scan(
     if let Err(e) = client.req_scanner_subscription(1, scanner_code, rows, min_price, max_price) {
         eprintln!("Failed to request scanner: {e}");
         client.disconnect();
-        return vec![];
+        return (vec![], Some(port));
     }
 
     // Wait for scanner results
     if !client.wait_scanner_done(Duration::from_secs(30)) {
         eprintln!("Timeout waiting for scanner results");
         client.disconnect();
-        return vec![];
+        return (vec![], Some(port));
     }
 
     // Request market data for all results
@@ -650,7 +653,7 @@ pub fn run_scan(
 
     let results = client.get_results();
     client.disconnect();
-    results
+    (results, Some(port))
 }
 
 /// Fetch scanner parameters XML from TWS.

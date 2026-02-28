@@ -29,6 +29,7 @@ pub enum BgMessage {
     ScanComplete {
         scanner_code: String,
         results: Vec<ScanResult>,
+        port: Option<u16>,
     },
     ListComplete {
         xml: Option<String>,
@@ -37,6 +38,7 @@ pub enum BgMessage {
     PollComplete {
         symbol_data: HashMap<String, ScanResult>,
         symbol_scanners: HashMap<String, Vec<String>>,
+        port: Option<u16>,
     },
 }
 
@@ -232,11 +234,11 @@ impl App {
         let code = scanner_code.clone();
 
         std::thread::spawn(move || {
-            let mut results = tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
+            let (mut results, port) = tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
             if !results.is_empty() {
                 rt_handle.block_on(async { enrich_results(&mut results).await });
             }
-            let _ = tx.send(BgMessage::ScanComplete { scanner_code: code, results });
+            let _ = tx.send(BgMessage::ScanComplete { scanner_code: code, results, port });
         });
     }
 
@@ -322,9 +324,13 @@ impl App {
         std::thread::spawn(move || {
             let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
             let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
+            let mut connected_port = None;
 
             for &(code, cid) in ALERT_SCANNERS {
-                let mut results = tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
+                let (mut results, port) = tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
+                if connected_port.is_none() {
+                    connected_port = port;
+                }
                 if !results.is_empty() {
                     rt_handle.block_on(async { enrich_results(&mut results).await });
                 }
@@ -339,14 +345,18 @@ impl App {
                 }
             }
 
-            let _ = tx.send(BgMessage::PollComplete { symbol_data, symbol_scanners });
+            let _ = tx.send(BgMessage::PollComplete { symbol_data, symbol_scanners, port: connected_port });
         });
     }
 
     pub fn handle_bg_message(&mut self, msg: BgMessage, rt: &tokio::runtime::Handle) {
         self.bg_busy = false;
         match msg {
-            BgMessage::ScanComplete { scanner_code, results } => {
+            BgMessage::ScanComplete { scanner_code, results, port } => {
+                if let Some(p) = port {
+                    self.connected_port = Some(p);
+                    self.update_title();
+                }
                 self.clear_output();
                 if results.is_empty() {
                     self.push_output("No results.");
@@ -440,7 +450,11 @@ impl App {
                     }
                 }
             }
-            BgMessage::PollComplete { symbol_data, symbol_scanners } => {
+            BgMessage::PollComplete { symbol_data, symbol_scanners, port } => {
+                if let Some(p) = port {
+                    self.connected_port = Some(p);
+                    self.update_title();
+                }
                 // Write to Supabase
                 if let Some(ref mut db) = self.db {
                     let batch: HashMap<String, (serde_json::Value, Vec<String>)> = symbol_data
