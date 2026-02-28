@@ -716,6 +716,19 @@ pub fn run_tui() -> Result<()> {
         info!("Connected to Supabase");
     }
 
+    // Probe TWS to discover the connected port
+    {
+        let ports: Vec<u16> = app
+            .settings
+            .port
+            .map(|p| vec![p])
+            .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
+        if let Ok(client) = tws::TwsClient::connect(&app.settings.host, &ports, 0) {
+            app.connected_port = Some(client.connected_port);
+            client.disconnect();
+        }
+    }
+
     app.update_title();
 
     // Initialize alerts from today's sightings
