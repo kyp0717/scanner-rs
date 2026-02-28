@@ -1,0 +1,28 @@
+[package]
+name = "scanner-rs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "scanner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+dotenv = "0.15"
+quick-xml = "0.37"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
