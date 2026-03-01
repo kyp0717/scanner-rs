@@ -50,6 +50,11 @@ cargo run -- enrich AAPL TSLA NVDA
 # Test configuration
 cargo run -- config show
 
+# Headless alert mode (streams alerts to stdout)
+cargo run -- alert
+cargo run -- alert --port 7497
+cargo run -- alert --json          # JSON lines on stdout, logs on stderr
+
 # Launch full TUI
 cargo run -- tui
 ```
@@ -60,14 +65,18 @@ src/
   main.rs          — CLI entry point with clap subcommands
   lib.rs           — re-exports all modules
   config.rs        — settings, .env loading, constants
+  models.rs        — shared data types (ScanResult, AlertRow, Settings, etc.)
   tws/
     mod.rs         — TWS client, connection, scanner subscriptions
     messages.rs    — IB API message encoding/decoding
+  engine/
+    mod.rs         — core alert engine (shared by TUI and CLI)
+  cli/
+    mod.rs         — CLI subcommand handlers (scan, alert, history, enrich)
   scanner.rs       — scanner logic, enrichment, filtering, table display
   history.rs       — Supabase persistence (sightings CRUD)
   enrichment.rs    — Yahoo Finance data fetching
   catalyst.rs      — news catalyst classification
-  models.rs        — shared data types (ScanResult, AlertRow, Settings, etc.)
   tui/
     mod.rs         — Textual-style TUI with ratatui
     app.rs         — app state and event loop
@@ -137,8 +146,17 @@ hit_count, last_price, change_pct, rvol, float_shares, catalyst, name, sector.
 - **Keep it simple** — ratatui for layout only, no over-engineering
 - **Tests first** — unit tests for all pure logic (filtering, classification, enrichment)
 
+## Logging
+- **tracing** writes structured logs to `var/scanner.log` (rolling daily)
+- **Alert CLI** uses `log_alert()` helper: `[HH:MM:SS] [LOG] message`
+  - Text mode (`--json` off): logs go to stdout interleaved with alerts
+  - JSON mode (`--json` on): logs go to stderr, stdout is clean JSON lines
+- Engine-level logging uses `tracing::{info, warn}` — not `eprintln!`
+
 ## TWS API Protocol
 Interactive Brokers TWS uses a binary protocol over TCP.
 - Ports: 7500 (paper), 7497 (live) — auto-detect with fallback
 - Client IDs: 1 (interactive), 3 (params), 10-17 (alert scanners)
+- Handshake: send `API\0` + length-prefixed version range `v100..176`
+- Server response is 4-byte BE length prefix + null-separated fields (v100+ format)
 - Market data type 4 = delayed frozen
