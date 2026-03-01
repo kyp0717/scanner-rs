@@ -25,10 +25,11 @@ const CATALYST_KEYWORDS: &[&str] = &[
     "resign",
 ];
 
-/// Classify news items and return the first headline matching a catalyst keyword.
+/// Classify news items and return the first headline matching a catalyst keyword,
+/// along with its publish timestamp (Unix epoch).
 ///
-/// Each news item should have a "title" field.
-pub fn classify_catalyst(news: &[serde_json::Value]) -> Option<String> {
+/// Each news item should have a "title" field and optionally "providerPublishTime".
+pub fn classify_catalyst(news: &[serde_json::Value]) -> Option<(String, Option<i64>)> {
     for item in news {
         let title = item
             .get("title")
@@ -37,7 +38,10 @@ pub fn classify_catalyst(news: &[serde_json::Value]) -> Option<String> {
         let title_lower = title.to_lowercase();
         for kw in CATALYST_KEYWORDS {
             if title_lower.contains(kw) {
-                return Some(title.to_string());
+                let publish_time = item
+                    .get("providerPublishTime")
+                    .and_then(|t| t.as_i64());
+                return Some((title.to_string(), publish_time));
             }
         }
     }
@@ -53,7 +57,14 @@ mod tests {
     fn test_classify_catalyst_fda() {
         let news = vec![json!({"title": "FDA Approves New Drug for ACME Corp"})];
         let result = classify_catalyst(&news);
-        assert_eq!(result, Some("FDA Approves New Drug for ACME Corp".to_string()));
+        assert_eq!(result, Some(("FDA Approves New Drug for ACME Corp".to_string(), None)));
+    }
+
+    #[test]
+    fn test_classify_catalyst_fda_with_timestamp() {
+        let news = vec![json!({"title": "FDA Approves New Drug", "providerPublishTime": 1700000000})];
+        let result = classify_catalyst(&news);
+        assert_eq!(result, Some(("FDA Approves New Drug".to_string(), Some(1700000000))));
     }
 
     #[test]
@@ -64,7 +75,7 @@ mod tests {
         ];
         let result = classify_catalyst(&news);
         assert_eq!(
-            result,
+            result.map(|(t, _)| t),
             Some("ACME beats earnings expectations".to_string())
         );
     }
@@ -96,7 +107,7 @@ mod tests {
             json!({"title": "Earnings beat expectations"}),
         ];
         let result = classify_catalyst(&news);
-        assert_eq!(result, Some("FDA approval announced".to_string()));
+        assert_eq!(result.map(|(t, _)| t), Some("FDA approval announced".to_string()));
     }
 
     #[test]

@@ -1030,11 +1030,16 @@ mod tests {
 
     #[test]
     fn test_enrichment_data_news_headlines() {
+        use crate::models::NewsHeadline;
         let data = crate::enrichment::EnrichmentData {
-            news_headlines: vec!["Headline 1".to_string(), "Headline 2".to_string()],
+            news_headlines: vec![
+                NewsHeadline { title: "Headline 1".to_string(), published: Some(1700000000) },
+                NewsHeadline { title: "Headline 2".to_string(), published: None },
+            ],
             ..Default::default()
         };
         assert_eq!(data.news_headlines.len(), 2);
-        assert_eq!(data.news_headlines[0], "Headline 1");
+        assert_eq!(data.news_headlines[0].title, "Headline 1");
+        assert_eq!(data.news_headlines[0].published, Some(1700000000));
     }
 }

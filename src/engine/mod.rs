@@ -357,6 +357,7 @@ impl AlertEngine {
                                 sector: None,
                                 industry: None,
                                 catalyst: None,
+                                catalyst_time: None,
                                 scanner_hits: hits,
                                 news_headlines: Vec::new(),
                                 enriched: false,
@@ -428,6 +429,7 @@ impl AlertEngine {
                         row.float_shares = data.float_shares;
                         row.short_pct = data.short_pct;
                         row.catalyst = data.catalyst;
+                        row.catalyst_time = data.catalyst_time;
                         row.news_headlines = data.news_headlines;
                         row.avg_volume = data.avg_volume;
                         if let (Some(vol), Some(avg)) = (row.volume, data.avg_volume) {
@@ -483,10 +485,24 @@ impl AlertEngine {
                             .unwrap_or(false)
                     });
 
-                    let news_headlines: Vec<String> = s
+                    // Deserialize news_headlines with backwards compat for old string-only format
+                    let news_headlines: Vec<crate::models::NewsHeadline> = s
                         .news_headlines
                         .as_deref()
-                        .and_then(|h| serde_json::from_str(h).ok())
+                        .and_then(|h| {
+                            // Try new format first: Vec<NewsHeadline>
+                            serde_json::from_str::<Vec<crate::models::NewsHeadline>>(h)
+                                .ok()
+                                .or_else(|| {
+                                    // Fallback: old Vec<String> format
+                                    serde_json::from_str::<Vec<String>>(h).ok().map(|titles| {
+                                        titles.into_iter().map(|title| crate::models::NewsHeadline {
+                                            title,
+                                            published: None,
+                                        }).collect()
+                                    })
+                                })
+                        })
                         .unwrap_or_default();
 
                     self.alert_rows.push(AlertRow {
@@ -502,6 +518,7 @@ impl AlertEngine {
                         sector: s.sector.clone(),
                         industry: s.industry.clone(),
                         catalyst: s.catalyst.clone(),
+                        catalyst_time: None,
                         scanner_hits: n_scans,
                         news_headlines,
                         enriched: enrichment_fresh,
@@ -671,6 +688,7 @@ mod tests {
             sector: None,
             industry: None,
             catalyst: None,
+            catalyst_time: None,
             scanner_hits: 3,
             news_headlines: Vec::new(),
             enriched: false,

@@ -315,9 +315,23 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
     ]));
 
     // Catalyst
+    let catalyst_display = r.catalyst.as_ref().map(|cat| {
+        let ago = r.catalyst_time.map(|epoch| {
+            let now = chrono::Utc::now().timestamp();
+            let diff = now - epoch;
+            if diff < 60 { "now".to_string() }
+            else if diff < 3600 { format!("{}m ago", diff / 60) }
+            else if diff < 86400 { format!("{}h ago", diff / 3600) }
+            else { format!("{}d ago", diff / 86400) }
+        });
+        match ago {
+            Some(a) => format!("{cat} ({a})"),
+            None => cat.clone(),
+        }
+    });
     lines.push(Line::from(vec![
         Span::styled("Catalyst  ", label_style),
-        fmt_or_dots(&r.catalyst),
+        fmt_or_dots(&catalyst_display),
     ]));
 
     // News Headlines
@@ -325,13 +339,30 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("News", label_style)));
         for (i, headline) in r.news_headlines.iter().take(5).enumerate() {
-            let truncated = if headline.len() > 50 {
-                format!("{}...", &headline[..47])
+            let ago = headline.published
+                .map(|epoch| {
+                    let now = chrono::Utc::now().timestamp();
+                    let diff = now - epoch;
+                    if diff < 60 { "now".to_string() }
+                    else if diff < 3600 { format!("{}m", diff / 60) }
+                    else if diff < 86400 { format!("{}h", diff / 3600) }
+                    else { format!("{}d", diff / 86400) }
+                })
+                .unwrap_or_default();
+            let prefix = if ago.is_empty() {
+                format!(" {}. ", i + 1)
             } else {
-                headline.clone()
+                format!(" {}. {} ", i + 1, ago)
+            };
+            let title = &headline.title;
+            let max_title = 50usize.saturating_sub(prefix.len());
+            let truncated = if title.len() > max_title {
+                format!("{}...", &title[..max_title.saturating_sub(3)])
+            } else {
+                title.clone()
             };
             lines.push(Line::from(Span::styled(
-                format!(" {}. {truncated}", i + 1),
+                format!("{prefix}{truncated}"),
                 Style::default().fg(Color::White),
             )));
         }

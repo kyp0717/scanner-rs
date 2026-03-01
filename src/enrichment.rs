@@ -4,7 +4,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::catalyst::classify_catalyst;
-use crate::models::ScanResult;
+use crate::models::{NewsHeadline, ScanResult};
 
 /// Fetch Yahoo Finance data for a single symbol.
 async fn fetch_yahoo_info(client: &Client, symbol: &str) -> Result<Value> {
@@ -65,7 +65,8 @@ pub struct EnrichmentData {
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
     pub catalyst: Option<String>,
-    pub news_headlines: Vec<String>,
+    pub catalyst_time: Option<i64>,
+    pub news_headlines: Vec<NewsHeadline>,
 }
 
 /// Fetch enrichment data for a single symbol.
@@ -91,10 +92,17 @@ pub async fn fetch_enrichment(client: &Client, symbol: &str) -> EnrichmentData {
     }
 
     if let Ok(news) = news_result {
-        data.catalyst = classify_catalyst(&news);
+        if let Some((cat_title, cat_time)) = classify_catalyst(&news) {
+            data.catalyst = Some(cat_title);
+            data.catalyst_time = cat_time;
+        }
         data.news_headlines = news
             .iter()
-            .filter_map(|item| item.get("title")?.as_str().map(String::from))
+            .filter_map(|item| {
+                let title = item.get("title")?.as_str()?.to_string();
+                let published = item.get("providerPublishTime").and_then(|t| t.as_i64());
+                Some(NewsHeadline { title, published })
+            })
             .collect();
     } else if let Err(e) = news_result {
         debug!("Yahoo Finance news fetch failed for {symbol}: {e}");

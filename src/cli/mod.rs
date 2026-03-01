@@ -137,9 +137,44 @@ pub async fn cmd_enrich(symbols: &[String]) -> Result<()> {
             "  Catalyst:    {}",
             data.catalyst.as_deref().unwrap_or("none")
         );
+        if let Some(ct) = data.catalyst_time {
+            println!("               {}", format_time_ago(ct));
+        }
+        if !data.news_headlines.is_empty() {
+            println!("  Headlines:");
+            for h in data.news_headlines.iter().take(5) {
+                let ago = h.published.map(format_time_ago).unwrap_or_default();
+                if ago.is_empty() {
+                    println!("    > {}", h.title);
+                } else {
+                    println!("    > {} — \"{}\"", ago, h.title);
+                }
+            }
+        }
         println!();
     }
     Ok(())
+}
+
+/// Format a Unix epoch timestamp as a relative "time ago" string.
+fn format_time_ago(epoch: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let diff = now - epoch;
+    if diff < 0 {
+        return "just now".to_string();
+    }
+    let mins = diff / 60;
+    let hours = diff / 3600;
+    let days = diff / 86400;
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else {
+        format!("{days}d ago")
+    }
 }
 
 /// Print configuration.
@@ -268,33 +303,87 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                     if let Some(row) =
                         engine.alert_rows.iter().find(|r| r.symbol == *symbol)
                     {
-                        let cat = row.catalyst.as_deref().unwrap_or("-");
-                        let name = row.name.as_deref().unwrap_or("-");
-                        let rvol = row
-                            .rvol
-                            .map(|r| format!("{r:.1}x"))
-                            .unwrap_or("-".into());
-                        let float = row
-                            .float_shares
-                            .map(|f| {
-                                if f >= 1e9 {
-                                    format!("{:.1}B", f / 1e9)
-                                } else if f >= 1e6 {
-                                    format!("{:.1}M", f / 1e6)
-                                } else {
-                                    format!("{:.0}", f)
-                                }
-                            })
-                            .unwrap_or("-".into());
-                        log_alert(json, &format!(
-                            "Enriched {}: name={} catalyst={} float={} rvol={}",
-                            symbol, name, cat, float, rvol
-                        ));
                         if json {
                             println!(
                                 "{}",
                                 serde_json::to_string(row).unwrap_or_default()
                             );
+                        } else {
+                            // Re-display alert line
+                            let chg = row
+                                .change_pct
+                                .map(|c| format!("{c:+.1}%"))
+                                .unwrap_or("-".into());
+                            let price = row
+                                .last
+                                .map(|p| format!("{p:.2}"))
+                                .unwrap_or("-".into());
+                            println!(
+                                "[{}] [ALERT] {:<6}  ${:>7}  {:>8}  {}/8 scanners",
+                                row.alert_time,
+                                row.symbol,
+                                price,
+                                chg,
+                                row.scanner_hits,
+                            );
+
+                            // Fundamentals card
+                            let name = row.name.as_deref().unwrap_or("-");
+                            let sector = row.sector.as_deref().unwrap_or("-");
+                            let float = row
+                                .float_shares
+                                .map(|f| {
+                                    if f >= 1e9 {
+                                        format!("{:.1}B", f / 1e9)
+                                    } else if f >= 1e6 {
+                                        format!("{:.1}M", f / 1e6)
+                                    } else {
+                                        format!("{:.0}", f)
+                                    }
+                                })
+                                .unwrap_or("-".into());
+                            let short = row
+                                .short_pct
+                                .map(|p| format!("{:.1}%", p * 100.0))
+                                .unwrap_or("-".into());
+                            let rvol = row
+                                .rvol
+                                .map(|r| format!("{r:.1}x"))
+                                .unwrap_or("-".into());
+
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!(
+                                "[{ts}] [FUNDAMENTALS] {}  {}  ({})",
+                                row.symbol, name, sector
+                            );
+                            println!(
+                                "           Float: {}  |  Short: {}  |  RVol: {}",
+                                float, short, rvol
+                            );
+
+                            // Catalyst with time
+                            if let Some(ref cat) = row.catalyst {
+                                let cat_ago = row.catalyst_time
+                                    .map(|t| format!("{} — ", format_time_ago(t)))
+                                    .unwrap_or_default();
+                                println!(
+                                    "           Catalyst: {cat_ago}\"{cat}\""
+                                );
+                            }
+
+                            // Headlines
+                            if !row.news_headlines.is_empty() {
+                                println!("           Headlines:");
+                                for h in row.news_headlines.iter().take(5) {
+                                    let ago = h.published
+                                        .map(|t| format!("{} — ", format_time_ago(t)))
+                                        .unwrap_or_default();
+                                    println!(
+                                        "             > {ago}\"{}\"",
+                                        h.title
+                                    );
+                                }
+                            }
                         }
                     }
                 }

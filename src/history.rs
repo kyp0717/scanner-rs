@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::config::SupabaseConfig;
 use crate::enrichment::EnrichmentData;
-use crate::models::Sighting;
+use crate::models::{NewsHeadline, Sighting};
 
 const TABLE: &str = "sightings";
 
@@ -264,10 +264,22 @@ impl SupabaseClient {
         }
 
         // Reconstruct EnrichmentData from cached fields
-        let news_headlines: Vec<String> = row
+        // Backwards compat: try Vec<NewsHeadline> first, then Vec<String>
+        let news_headlines: Vec<NewsHeadline> = row
             .get("news_headlines")
             .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
+            .and_then(|s| {
+                serde_json::from_str::<Vec<NewsHeadline>>(s)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_str::<Vec<String>>(s).ok().map(|titles| {
+                            titles.into_iter().map(|title| NewsHeadline {
+                                title,
+                                published: None,
+                            }).collect()
+                        })
+                    })
+            })
             .unwrap_or_default();
 
         Some(EnrichmentData {
@@ -278,6 +290,7 @@ impl SupabaseClient {
             short_pct: row.get("short_pct").and_then(|v| v.as_f64()),
             avg_volume: row.get("avg_volume").and_then(|v| v.as_i64()),
             catalyst: row.get("catalyst").and_then(|v| v.as_str()).map(String::from),
+            catalyst_time: None,
             news_headlines,
         })
     }

@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// A news headline with optional publish timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsHeadline {
+    pub title: String,
+    pub published: Option<i64>,
+}
+
 /// Result from a TWS scanner + enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScanResult {
@@ -41,8 +48,9 @@ pub struct AlertRow {
     pub sector: Option<String>,
     pub industry: Option<String>,
     pub catalyst: Option<String>,
+    pub catalyst_time: Option<i64>,
     pub scanner_hits: u32,
-    pub news_headlines: Vec<String>,
+    pub news_headlines: Vec<NewsHeadline>,
     pub enriched: bool,
     pub avg_volume: Option<i64>,
 }
@@ -180,7 +188,7 @@ mod tests {
             industry: Some("Biotech".to_string()),
             short_pct: Some(0.15),
             avg_volume: Some(1_000_000),
-            news_headlines: Some(r#"["Headline 1"]"#.to_string()),
+            news_headlines: Some(r#"[{"title":"Headline 1","published":null}]"#.to_string()),
         };
         assert_eq!(s.industry, Some("Biotech".to_string()));
         assert_eq!(s.avg_volume, Some(1_000_000));
