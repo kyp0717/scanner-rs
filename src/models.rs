@@ -63,6 +63,12 @@ pub struct Sighting {
     pub catalyst: Option<String>,
     pub name: Option<String>,
     pub sector: Option<String>,
+    // Enrichment cache fields
+    pub enriched_at: Option<String>,
+    pub industry: Option<String>,
+    pub short_pct: Option<f64>,
+    pub avg_volume: Option<i64>,
+    pub news_headlines: Option<String>, // JSON array string
 }
 
 /// Application settings.
@@ -152,6 +158,32 @@ mod tests {
         assert!(s.port.is_none());
         assert_eq!(s.min_price, Some(1.0));
         assert!(s.max_price.is_none());
+    }
+
+    #[test]
+    fn test_sighting_new_fields() {
+        let s = Sighting {
+            id: None,
+            symbol: "TEST".to_string(),
+            first_seen: "2024-01-01T00:00:00+00:00".to_string(),
+            last_seen: "2024-01-01T00:00:00+00:00".to_string(),
+            scanners: "".to_string(),
+            hit_count: None,
+            last_price: None,
+            change_pct: None,
+            rvol: None,
+            float_shares: None,
+            catalyst: None,
+            name: None,
+            sector: None,
+            enriched_at: Some("2024-01-01T00:00:00+00:00".to_string()),
+            industry: Some("Biotech".to_string()),
+            short_pct: Some(0.15),
+            avg_volume: Some(1_000_000),
+            news_headlines: Some(r#"["Headline 1"]"#.to_string()),
+        };
+        assert_eq!(s.industry, Some("Biotech".to_string()));
+        assert_eq!(s.avg_volume, Some(1_000_000));
     }
 
     #[test]

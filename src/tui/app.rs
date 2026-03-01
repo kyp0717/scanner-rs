@@ -1,4 +1,3 @@
-use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -602,61 +601,13 @@ pub fn run_tui() -> Result<()> {
 
     let mut app = App::new(AlertEngine::new(enrich_tx, Settings::default(), db));
 
-    // Spawn enrichment worker with the engine's bg_tx
-    {
-        let bg_tx = app.engine.bg_tx.clone();
-        let rt_handle = handle.clone();
-        std::thread::spawn(move || {
-            let client = reqwest::Client::new();
-            let mut heap =
-                std::collections::BinaryHeap::<crate::engine::EnrichRequest>::new();
-            let mut enriched_set = std::collections::HashSet::<String>::new();
-
-            loop {
-                loop {
-                    match enrich_rx.try_recv() {
-                        Ok(req) => {
-                            if req.symbol.is_empty() {
-                                enriched_set.clear();
-                                heap.clear();
-                                continue;
-                            }
-                            if !enriched_set.contains(&req.symbol) {
-                                heap.push(req);
-                            }
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                if let Some(req) = heap.pop() {
-                    if enriched_set.contains(&req.symbol) {
-                        continue;
-                    }
-                    enriched_set.insert(req.symbol.clone());
-                    let data = rt_handle
-                        .block_on(crate::enrichment::fetch_enrichment(&client, &req.symbol));
-                    let _ = bg_tx.send(crate::engine::BgMessage::EnrichComplete {
-                        symbol: req.symbol,
-                        data,
-                    });
-                } else {
-                    match enrich_rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(req) => {
-                            if req.symbol.is_empty() {
-                                enriched_set.clear();
-                            } else if !enriched_set.contains(&req.symbol) {
-                                heap.push(req);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-            }
-        });
-    }
+    // Spawn enrichment worker with Supabase cache support
+    let _worker = crate::engine::spawn_enrichment_worker(
+        app.engine.bg_tx.clone(),
+        enrich_rx,
+        handle.clone(),
+        app.engine.db.clone(),
+    );
 
     // Probe TWS port
     app.engine.probe_port();
@@ -792,6 +743,7 @@ pub fn run_tui() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     fn new_app() -> App {
         let (tx, _rx) = mpsc::channel();

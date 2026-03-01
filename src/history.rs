@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{Local, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::config::SupabaseConfig;
+use crate::enrichment::EnrichmentData;
 use crate::models::Sighting;
 
 const TABLE: &str = "sightings";
@@ -193,6 +194,11 @@ impl SupabaseClient {
                     ("catalyst", "catalyst"),
                     ("name", "name"),
                     ("sector", "sector"),
+                    ("industry", "industry"),
+                    ("short_pct", "short_pct"),
+                    ("avg_volume", "avg_volume"),
+                    ("news_headlines", "news_headlines"),
+                    ("enriched_at", "enriched_at"),
                 ] {
                     if let Some(val) = data.get(data_key) {
                         if !val.is_null() {
@@ -204,7 +210,7 @@ impl SupabaseClient {
                 let filter = format!("symbol=eq.{sym}");
                 self.update(&filter, &update).await?;
             } else {
-                inserts.push(json!({
+                let mut insert = json!({
                     "symbol": sym,
                     "first_seen": now,
                     "last_seen": now,
@@ -217,7 +223,15 @@ impl SupabaseClient {
                     "catalyst": data.get("catalyst").cloned().unwrap_or(Value::Null),
                     "name": data.get("name").cloned().unwrap_or(Value::Null),
                     "sector": data.get("sector").cloned().unwrap_or(Value::Null),
-                }));
+                });
+                for key in &["industry", "short_pct", "avg_volume", "news_headlines", "enriched_at"] {
+                    if let Some(val) = data.get(key) {
+                        if !val.is_null() {
+                            insert[key] = val.clone();
+                        }
+                    }
+                }
+                inserts.push(insert);
             }
         }
 
@@ -226,6 +240,46 @@ impl SupabaseClient {
         }
 
         Ok(())
+    }
+
+    /// Check enrichment cache for a symbol. Returns Some(EnrichmentData) if
+    /// the symbol has been enriched within `max_age`.
+    pub async fn get_enrichment_cache(
+        &self,
+        symbol: &str,
+        max_age: std::time::Duration,
+    ) -> Option<EnrichmentData> {
+        let query = format!(
+            "select=name,sector,industry,float_shares,short_pct,avg_volume,catalyst,news_headlines,enriched_at&symbol=eq.{symbol}&limit=1"
+        );
+        let rows = self.select(&query).await.ok()?;
+        let row = rows.into_iter().next()?;
+
+        // Check enriched_at freshness
+        let enriched_at_str = row.get("enriched_at")?.as_str()?;
+        let enriched_at = chrono::DateTime::parse_from_rfc3339(enriched_at_str).ok()?;
+        let age = Utc::now().signed_duration_since(enriched_at.with_timezone(&Utc));
+        if age > chrono::Duration::from_std(max_age).ok()? {
+            return None;
+        }
+
+        // Reconstruct EnrichmentData from cached fields
+        let news_headlines: Vec<String> = row
+            .get("news_headlines")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        Some(EnrichmentData {
+            name: row.get("name").and_then(|v| v.as_str()).map(String::from),
+            sector: row.get("sector").and_then(|v| v.as_str()).map(String::from),
+            industry: row.get("industry").and_then(|v| v.as_str()).map(String::from),
+            float_shares: row.get("float_shares").and_then(|v| v.as_f64()),
+            short_pct: row.get("short_pct").and_then(|v| v.as_f64()),
+            avg_volume: row.get("avg_volume").and_then(|v| v.as_i64()),
+            catalyst: row.get("catalyst").and_then(|v| v.as_str()).map(String::from),
+            news_headlines,
+        })
     }
 
     /// Get history (all sightings, ordered by first_seen DESC).
@@ -396,6 +450,11 @@ mod tests {
             catalyst: Some("FDA approval for new drug".to_string()),
             name: Some("Apple Inc".to_string()),
             sector: Some("Technology".to_string()),
+            enriched_at: None,
+            industry: None,
+            short_pct: None,
+            avg_volume: None,
+            news_headlines: None,
         }];
         // Should not panic
         print_history(&sightings, "Today");

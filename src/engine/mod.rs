@@ -389,11 +389,18 @@ impl AlertEngine {
                 BgMessage::EnrichComplete { symbol, data } => {
                     // Write enrichment to Supabase
                     if let Some(ref mut db) = self.db {
+                        let headlines_json = serde_json::to_string(&data.news_headlines)
+                            .unwrap_or_else(|_| "[]".to_string());
                         let supa_data = serde_json::json!({
                             "name": &data.name,
                             "sector": &data.sector,
                             "catalyst": &data.catalyst,
                             "float_shares": data.float_shares,
+                            "industry": &data.industry,
+                            "short_pct": data.short_pct,
+                            "avg_volume": data.avg_volume,
+                            "news_headlines": headlines_json,
+                            "enriched_at": chrono::Utc::now().to_rfc3339(),
                         });
                         let batch: HashMap<String, (serde_json::Value, Vec<String>)> =
                             [(symbol.clone(), (supa_data, vec![]))]
@@ -463,7 +470,25 @@ impl AlertEngine {
                     self.alert_seen.insert(s.symbol.clone());
                     let scanners_str = &s.scanners;
                     let n_scans = scanners_str.split(',').count() as u32;
-                    let has_enrichment = s.name.is_some() || s.catalyst.is_some();
+
+                    // Check if enrichment is fresh (within cache TTL)
+                    let enrichment_fresh = s.enriched_at.as_ref().map_or(false, |ea| {
+                        chrono::DateTime::parse_from_rfc3339(ea)
+                            .map(|dt| {
+                                let age = chrono::Utc::now()
+                                    .signed_duration_since(dt.with_timezone(&chrono::Utc));
+                                age < chrono::Duration::from_std(ENRICH_CACHE_TTL)
+                                    .unwrap_or(chrono::Duration::zero())
+                            })
+                            .unwrap_or(false)
+                    });
+
+                    let news_headlines: Vec<String> = s
+                        .news_headlines
+                        .as_deref()
+                        .and_then(|h| serde_json::from_str(h).ok())
+                        .unwrap_or_default();
+
                     self.alert_rows.push(AlertRow {
                         symbol: s.symbol.clone(),
                         alert_time: crate::history::local_time_str(&s.first_seen),
@@ -472,17 +497,17 @@ impl AlertEngine {
                         volume: None,
                         rvol: s.rvol,
                         float_shares: s.float_shares,
-                        short_pct: None,
+                        short_pct: s.short_pct,
                         name: s.name.clone(),
                         sector: s.sector.clone(),
-                        industry: None,
+                        industry: s.industry.clone(),
                         catalyst: s.catalyst.clone(),
                         scanner_hits: n_scans,
-                        news_headlines: Vec::new(),
-                        enriched: has_enrichment,
-                        avg_volume: None,
+                        news_headlines,
+                        enriched: enrichment_fresh,
+                        avg_volume: s.avg_volume,
                     });
-                    if !has_enrichment {
+                    if !enrichment_fresh {
                         needs_enrich += 1;
                         self.queue_enrich(&s.symbol, n_scans);
                     }
@@ -495,13 +520,16 @@ impl AlertEngine {
     }
 }
 
-/// Spawn the enrichment worker thread. Returns the sender for EnrichRequests.
+/// Cache TTL for enrichment data (15 minutes).
+const ENRICH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Spawn the enrichment worker thread with optional Supabase cache.
 pub fn spawn_enrichment_worker(
     bg_tx: mpsc::Sender<BgMessage>,
+    enrich_rx: mpsc::Receiver<EnrichRequest>,
     rt_handle: tokio::runtime::Handle,
-) -> mpsc::Sender<EnrichRequest> {
-    let (enrich_tx, enrich_rx) = mpsc::channel::<EnrichRequest>();
-
+    db: Option<SupabaseClient>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let client = reqwest::Client::new();
         let mut heap = BinaryHeap::<EnrichRequest>::new();
@@ -533,7 +561,21 @@ pub fn spawn_enrichment_worker(
                     continue;
                 }
                 enriched_set.insert(req.symbol.clone());
-                let data = rt_handle.block_on(fetch_enrichment(&client, &req.symbol));
+
+                // Try Supabase cache first
+                let cached = db.as_ref().and_then(|db| {
+                    rt_handle
+                        .block_on(db.get_enrichment_cache(&req.symbol, ENRICH_CACHE_TTL))
+                });
+
+                let data = if let Some(cached_data) = cached {
+                    info!(symbol = %req.symbol, "enrichment cache hit");
+                    cached_data
+                } else {
+                    info!(symbol = %req.symbol, priority = req.scanner_hits, "enriching via Yahoo");
+                    rt_handle.block_on(fetch_enrichment(&client, &req.symbol))
+                };
+
                 let _ = bg_tx.send(BgMessage::EnrichComplete {
                     symbol: req.symbol,
                     data,
@@ -553,9 +595,7 @@ pub fn spawn_enrichment_worker(
                 }
             }
         }
-    });
-
-    enrich_tx
+    })
 }
 
 #[cfg(test)]

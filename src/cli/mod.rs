@@ -182,66 +182,13 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
 
     let mut engine = AlertEngine::new(enrich_tx, settings, db);
 
-    // Spawn enrichment worker with engine's bg_tx
-    {
-        let bg_tx = engine.bg_tx.clone();
-        let rt_handle = handle.clone();
-        let json_mode = json;
-        std::thread::spawn(move || {
-            let client = reqwest::Client::new();
-            let mut heap =
-                std::collections::BinaryHeap::<crate::engine::EnrichRequest>::new();
-            let mut enriched_set = std::collections::HashSet::<String>::new();
-
-            loop {
-                loop {
-                    match enrich_rx.try_recv() {
-                        Ok(req) => {
-                            if req.symbol.is_empty() {
-                                enriched_set.clear();
-                                heap.clear();
-                                log_alert(json_mode, "Enrichment queue cleared");
-                                continue;
-                            }
-                            if !enriched_set.contains(&req.symbol) {
-                                heap.push(req);
-                            }
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                    }
-                }
-
-                if let Some(req) = heap.pop() {
-                    if enriched_set.contains(&req.symbol) {
-                        continue;
-                    }
-                    log_alert(json_mode, &format!("Enriching {} (priority {})...", req.symbol, req.scanner_hits));
-                    enriched_set.insert(req.symbol.clone());
-                    let data = rt_handle
-                        .block_on(crate::enrichment::fetch_enrichment(&client, &req.symbol));
-                    log_alert(json_mode, &format!("Enrichment complete: {}", req.symbol));
-                    let _ = bg_tx.send(crate::engine::BgMessage::EnrichComplete {
-                        symbol: req.symbol,
-                        data,
-                    });
-                } else {
-                    match enrich_rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(req) => {
-                            if req.symbol.is_empty() {
-                                enriched_set.clear();
-                                log_alert(json_mode, "Enrichment queue cleared");
-                            } else if !enriched_set.contains(&req.symbol) {
-                                heap.push(req);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-            }
-        });
-    }
+    // Spawn enrichment worker with Supabase cache support
+    let _worker = crate::engine::spawn_enrichment_worker(
+        engine.bg_tx.clone(),
+        enrich_rx,
+        handle.clone(),
+        engine.db.clone(),
+    );
 
     let ports_desc = engine.settings.port
         .map(|p| format!("{p}"))
