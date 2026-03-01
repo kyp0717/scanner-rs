@@ -1,17 +1,18 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tracing::info;
 
 use crate::config::SupabaseConfig;
-use crate::enrichment::{fetch_enrichment, EnrichmentData};
+use crate::engine::{AlertEngine, EngineEvent};
 use crate::history::SupabaseClient;
 use crate::models::*;
 use crate::tws;
@@ -24,53 +25,11 @@ pub enum Mode {
     Scan,
 }
 
-/// Message from a background TWS operation.
-pub enum BgMessage {
-    ScanComplete {
-        scanner_code: String,
-        results: Vec<ScanResult>,
-        port: Option<u16>,
-    },
-    ListComplete {
-        xml: Option<String>,
-        group: Option<String>,
-    },
-    PollComplete {
-        symbol_data: HashMap<String, ScanResult>,
-        symbol_scanners: HashMap<String, Vec<String>>,
-        port: Option<u16>,
-    },
-    EnrichComplete {
-        symbol: String,
-        data: EnrichmentData,
-    },
-}
-
-/// Request to enrich a symbol, ordered by scanner_hits (higher = higher priority).
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct EnrichRequest {
-    pub symbol: String,
-    pub scanner_hits: u32,
-}
-
-impl Ord for EnrichRequest {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.scanner_hits.cmp(&other.scanner_hits)
-    }
-}
-
-impl PartialOrd for EnrichRequest {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Application state for the TUI.
+/// Application state for the TUI — thin wrapper around AlertEngine.
 pub struct App {
-    pub settings: Settings,
+    pub engine: AlertEngine,
+    // TUI-only state
     pub mode: Mode,
-    pub alert_rows: Vec<AlertRow>,
-    pub alert_seen: HashSet<String>,
     pub output_lines: Vec<String>,
     pub alert_line: String,
     pub title: String,
@@ -78,26 +37,16 @@ pub struct App {
     pub input_cursor: usize,
     pub command_history: Vec<String>,
     pub history_idx: i32,
-    pub polling: bool,
-    pub connected_port: Option<u16>,
-    pub db: Option<SupabaseClient>,
     pub should_quit: bool,
     pub selected_alert_row: usize,
     pub scroll_offset: u16,
-    pub bg_tx: mpsc::Sender<BgMessage>,
-    pub bg_rx: mpsc::Receiver<BgMessage>,
-    pub bg_busy: bool,
-    pub enrich_tx: mpsc::Sender<EnrichRequest>,
 }
 
 impl App {
-    pub fn new(enrich_tx: mpsc::Sender<EnrichRequest>) -> Self {
-        let (bg_tx, bg_rx) = mpsc::channel();
+    pub fn new(engine: AlertEngine) -> Self {
         Self {
-            settings: Settings::default(),
+            engine,
             mode: Mode::Alert,
-            alert_rows: Vec::new(),
-            alert_seen: HashSet::new(),
             output_lines: Vec::new(),
             alert_line: "No alerts".to_string(),
             title: "Scanner REPL -- type help for commands".to_string(),
@@ -105,38 +54,27 @@ impl App {
             input_cursor: 0,
             command_history: Vec::new(),
             history_idx: -1,
-            polling: false,
-            connected_port: None,
-            db: None,
             should_quit: false,
             selected_alert_row: 0,
             scroll_offset: 0,
-            bg_tx,
-            bg_rx,
-            bg_busy: false,
-            enrich_tx,
         }
-    }
-
-    /// Queue enrichment for a symbol if the channel is available.
-    fn queue_enrich(&self, symbol: &str, scanner_hits: u32) {
-        let _ = self.enrich_tx.send(EnrichRequest {
-            symbol: symbol.to_string(),
-            scanner_hits,
-        });
     }
 
     fn update_title(&mut self) {
         let port = self
+            .engine
             .connected_port
-            .or(self.settings.port)
+            .or(self.engine.settings.port)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "auto".to_string());
         let mode_tag = match self.mode {
             Mode::Alert => "[ALERT]",
             Mode::Scan => "[SCAN]",
         };
-        self.title = format!("Scanner REPL -- {}:{} {}", self.settings.host, port, mode_tag);
+        self.title = format!(
+            "Scanner REPL -- {}:{} {}",
+            self.engine.settings.host, port, mode_tag
+        );
     }
 
     fn push_output(&mut self, line: &str) {
@@ -173,7 +111,7 @@ impl App {
         match cmd.as_str() {
             "quit" | "exit" | "q" => self.should_quit = true,
             "help" => self.cmd_help(),
-            "scan" => self.cmd_scan(args, rt),
+            "scan" => self.cmd_scan(args),
             "list" => self.cmd_list(args),
             "set" => self.cmd_set(args),
             "show" => self.cmd_show(),
@@ -212,21 +150,23 @@ impl App {
         }
     }
 
-    fn cmd_scan(&mut self, args: &[&str], _rt: &tokio::runtime::Handle) {
+    fn cmd_scan(&mut self, args: &[&str]) {
         if args.is_empty() {
-            self.push_output("Usage: scan <alias|code> [--rows N] [--min-price N] [--max-price N]");
+            self.push_output(
+                "Usage: scan <alias|code> [--rows N] [--min-price N] [--max-price N]",
+            );
             return;
         }
 
-        if self.bg_busy {
+        if self.engine.bg_busy {
             self.push_output("Background operation in progress, please wait...");
             return;
         }
 
         let scanner_code = resolve_scanner(args[0]);
-        let mut rows = self.settings.rows;
-        let mut min_price = self.settings.min_price;
-        let mut max_price = self.settings.max_price;
+        let mut rows = self.engine.settings.rows;
+        let mut min_price = self.engine.settings.min_price;
+        let mut max_price = self.engine.settings.max_price;
 
         let mut i = 1;
         while i < args.len() {
@@ -254,85 +194,57 @@ impl App {
         self.update_title();
         self.push_output(&format!("Scanning {scanner_code} (rows={rows})..."));
         self.alert_line = format!("Scanning {scanner_code}...");
-        self.bg_busy = true;
 
-        let ports: Vec<u16> = self
-            .settings
-            .port
-            .map(|p| vec![p])
-            .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-        let host = self.settings.host.clone();
-        let tx = self.bg_tx.clone();
-        let code = scanner_code.clone();
-
-        std::thread::spawn(move || {
-            let (results, port) = tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
-            let _ = tx.send(BgMessage::ScanComplete { scanner_code: code, results, port });
-        });
+        self.engine.start_scan(&scanner_code, rows, min_price, max_price);
     }
 
     fn cmd_list(&mut self, args: &[&str]) {
-        if self.bg_busy {
+        if self.engine.bg_busy {
             self.push_output("Background operation in progress, please wait...");
             return;
         }
 
-        let ports: Vec<u16> = self
-            .settings
-            .port
-            .map(|p| vec![p])
-            .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-        let host = self.settings.host.clone();
-        let group = if args.is_empty() { None } else { Some(args.join(" ")) };
-        let tx = self.bg_tx.clone();
+        let group = if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        };
 
         self.push_output("Fetching scanner groups...");
-        self.bg_busy = true;
-
-        std::thread::spawn(move || {
-            let xml = tws::fetch_scanner_params(&host, &ports, 3);
-            let _ = tx.send(BgMessage::ListComplete { xml, group });
-        });
+        self.engine.start_list(group);
     }
 
-    fn cmd_poll(&mut self, args: &[&str], rt: &tokio::runtime::Handle) {
+    fn cmd_poll(&mut self, args: &[&str], _rt: &tokio::runtime::Handle) {
         if args.is_empty() {
-            let status = if self.polling { "on" } else { "off" };
+            let status = if self.engine.polling { "on" } else { "off" };
             self.push_output(&format!(
                 "  Polling: {}  |  Seen: {} symbols",
                 status,
-                self.alert_seen.len()
+                self.engine.alert_seen.len()
             ));
             return;
         }
 
         match args[0].to_lowercase().as_str() {
             "on" => {
-                if self.polling {
+                if self.engine.polling {
                     self.push_output("Polling already active");
                     return;
                 }
-                self.polling = true;
+                let _ = self.engine.poll_on();
                 self.push_output("Polling started -- scanning every 60s");
                 self.alert_line = "Polling active".to_string();
-                // Run first poll immediately
-                self.run_poll_scanners(rt);
             }
             "off" => {
-                self.polling = false;
+                self.engine.poll_off();
                 self.push_output("Polling stopped");
                 self.alert_line = "Polling stopped".to_string();
             }
             "clear" => {
-                let count = self.alert_seen.len();
-                self.alert_seen.clear();
-                self.alert_rows.clear();
-                // Send sentinel to enrichment worker to clear its seen set
-                let _ = self.enrich_tx.send(EnrichRequest {
-                    symbol: String::new(),
-                    scanner_hits: 0,
-                });
-                self.push_output(&format!("Cleared {count} seen symbols and alert table"));
+                let count = self.engine.poll_clear();
+                self.push_output(&format!(
+                    "Cleared {count} seen symbols and alert table"
+                ));
             }
             _ => {
                 self.push_output("Usage: poll [on|off|clear]");
@@ -340,285 +252,8 @@ impl App {
         }
     }
 
-    fn run_poll_scanners(&mut self, _rt: &tokio::runtime::Handle) {
-        if self.bg_busy {
-            return; // Skip if already busy
-        }
-
-        self.bg_busy = true;
-        let ports: Vec<u16> = self
-            .settings
-            .port
-            .map(|p| vec![p])
-            .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-        let host = self.settings.host.clone();
-        let tx = self.bg_tx.clone();
-
-        std::thread::spawn(move || {
-            let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
-            let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
-            let mut connected_port = None;
-
-            for &(code, cid) in ALERT_SCANNERS {
-                let (results, port) = tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
-                if connected_port.is_none() {
-                    connected_port = port;
-                }
-
-                for r in results {
-                    let sym = r.symbol.clone();
-                    symbol_scanners
-                        .entry(sym.clone())
-                        .or_default()
-                        .push(code.to_string());
-                    symbol_data.entry(sym).or_insert(r);
-                }
-            }
-
-            let _ = tx.send(BgMessage::PollComplete { symbol_data, symbol_scanners, port: connected_port });
-        });
-    }
-
-    pub fn handle_bg_message(&mut self, msg: BgMessage, rt: &tokio::runtime::Handle) {
-        self.bg_busy = false;
-        match msg {
-            BgMessage::ScanComplete { scanner_code, results, port } => {
-                if let Some(p) = port {
-                    self.connected_port = Some(p);
-                    self.update_title();
-                }
-                self.clear_output();
-                if results.is_empty() {
-                    self.push_output("No results.");
-                    self.alert_line = format!("{scanner_code} -- 0 results");
-                } else {
-                    self.push_output(&format!(
-                        "{:>3}  {:<6}  {:>8}  {:>8}  {:>12}  {:>6}  {:>8}  {:>7}  {:<20}  {:<14}  {}",
-                        "#", "Symbol", "Last", "Chg%", "Volume", "RVol", "Float", "Short%", "Name", "Sector", "Catalyst"
-                    ));
-                    self.push_output(&"-".repeat(120));
-
-                    for r in &results {
-                        use crate::scanner::*;
-                        let name = r.name.as_deref().unwrap_or("-");
-                        let sector = r.sector.as_deref().unwrap_or("-");
-                        let catalyst = r.catalyst.as_deref().unwrap_or("");
-                        self.push_output(&format!(
-                            "{:>3}  {:<6}  {:>8}  {:>8}  {:>12}  {:>6}  {:>8}  {:>7}  {:<20}  {:<14}  {}",
-                            r.rank,
-                            r.symbol,
-                            fmt_price(r.last),
-                            fmt_change_pct(r.change_pct),
-                            fmt_volume(r.volume),
-                            fmt_rvol(r.rvol),
-                            fmt_float(r.float_shares),
-                            fmt_short_pct(r.short_pct),
-                            truncate(name, 20),
-                            truncate(sector, 14),
-                            truncate(catalyst, 30),
-                        ));
-                    }
-                    self.push_output(&format!("\nTotal: {} stocks", results.len()));
-                    let now = chrono::Local::now().format("%H:%M:%S");
-                    self.alert_line = format!("[{now}] {scanner_code} -- {} results", results.len());
-                    // Queue enrichment for scan results
-                    for r in &results {
-                        self.queue_enrich(&r.symbol, 1);
-                    }
-                }
-            }
-            BgMessage::ListComplete { xml, group } => {
-                self.clear_output();
-                match xml {
-                    Some(xml) => {
-                        let tree = tws::group_scans(&xml);
-                        let total: usize = tree.values().flat_map(|cats| cats.values().map(|s| s.len())).sum();
-
-                        if let Some(query) = group {
-                            let query_lower = query.to_lowercase();
-                            for inst in tree.keys() {
-                                for (cat, entries) in &tree[inst] {
-                                    if cat.to_lowercase().contains(&query_lower) {
-                                        self.push_output(&format!(
-                                            "{inst} > {cat} ({} scanners)",
-                                            entries.len()
-                                        ));
-                                        self.push_output(&format!("{:<30}  {}", "Scanner Code", "Description"));
-                                        self.push_output(&"-".repeat(60));
-                                        let mut sorted = entries.clone();
-                                        sorted.sort_by(|a, b| a.1.cmp(&b.1));
-                                        for (code, disp) in &sorted {
-                                            self.push_output(&format!("{code:<30}  {disp}"));
-                                        }
-                                        return;
-                                    }
-                                }
-                            }
-                            self.push_output(&format!("No group matching '{query}'"));
-                        } else {
-                            self.push_output(&format!("Scanners -- {total} total"));
-                            self.push_output(&format!(
-                                "{:<20}  {:<30}  {:>5}",
-                                "Instrument", "Category", "Count"
-                            ));
-                            self.push_output(&"-".repeat(60));
-                            let mut instruments: Vec<_> = tree.keys().collect();
-                            instruments.sort();
-                            for inst in instruments {
-                                let cats = &tree[inst];
-                                let mut cat_names: Vec<_> = cats.keys().collect();
-                                cat_names.sort();
-                                let mut first = true;
-                                for cat in cat_names {
-                                    let count = cats[cat].len();
-                                    let inst_col = if first { inst.as_str() } else { "" };
-                                    self.push_output(&format!("{inst_col:<20}  {cat:<30}  {count:>5}"));
-                                    first = false;
-                                }
-                            }
-                            self.push_output("\nUse 'list <group>' to expand a category.");
-                        }
-                    }
-                    None => {
-                        self.push_output("Could not connect to TWS");
-                    }
-                }
-            }
-            BgMessage::PollComplete { symbol_data, symbol_scanners, port } => {
-                if let Some(p) = port {
-                    self.connected_port = Some(p);
-                    self.update_title();
-                }
-                // Write to Supabase
-                if let Some(ref mut db) = self.db {
-                    let batch: HashMap<String, (serde_json::Value, Vec<String>)> = symbol_data
-                        .iter()
-                        .map(|(sym, r)| {
-                            let data = serde_json::json!({
-                                "last": r.last,
-                                "change_pct": r.change_pct,
-                                "rvol": r.rvol,
-                                "float_shares": r.float_shares,
-                                "catalyst": r.catalyst,
-                                "name": r.name,
-                                "sector": r.sector,
-                            });
-                            (
-                                sym.clone(),
-                                (data, symbol_scanners.get(sym).cloned().unwrap_or_default()),
-                            )
-                        })
-                        .collect();
-                    let _ = rt.block_on(db.record_stocks_batch(&batch));
-                }
-
-                // Alert on new symbols
-                let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                let new_syms: Vec<String> = symbol_data
-                    .keys()
-                    .filter(|s| !self.alert_seen.contains(*s))
-                    .cloned()
-                    .collect();
-
-                if new_syms.is_empty() {
-                    self.alert_line = format!(
-                        "[{now}] Polling -- {} stocks, no new alerts (seen {})",
-                        symbol_data.len(),
-                        self.alert_seen.len()
-                    );
-                } else {
-                    for sym in &new_syms {
-                        self.alert_seen.insert(sym.clone());
-                        if let Some(r) = symbol_data.get(sym) {
-                            let hits = symbol_scanners.get(sym).map(|s| s.len() as u32).unwrap_or(0);
-                            self.alert_rows.push(AlertRow {
-                                symbol: sym.clone(),
-                                alert_time: now.clone(),
-                                last: r.last,
-                                change_pct: r.change_pct,
-                                volume: r.volume,
-                                rvol: None,
-                                float_shares: None,
-                                short_pct: None,
-                                name: None,
-                                sector: None,
-                                industry: None,
-                                catalyst: None,
-                                scanner_hits: hits,
-                                news_headlines: Vec::new(),
-                                enriched: false,
-                                avg_volume: None,
-                            });
-                            self.queue_enrich(sym, hits);
-                        }
-                    }
-
-                    // Sort alert rows
-                    self.alert_rows.sort_by(|a, b| {
-                        b.scanner_hits
-                            .cmp(&a.scanner_hits)
-                            .then_with(|| {
-                                b.change_pct
-                                    .unwrap_or(0.0)
-                                    .partial_cmp(&a.change_pct.unwrap_or(0.0))
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-
-                    // Set alert line to top alert
-                    if let Some(top) = self.alert_rows.first() {
-                        let chg = top.change_pct.unwrap_or(0.0);
-                        let rvol = top.rvol.unwrap_or(0.0);
-                        let cat = top.catalyst.as_deref().unwrap_or("");
-                        let cat_short = if cat.len() > 30 {
-                            format!("{}..", &cat[..28])
-                        } else {
-                            cat.to_string()
-                        };
-                        self.alert_line = format!(
-                            "[{now}] ALERT: {} +{chg:.1}% RVol {rvol:.1}x ({} scanners) -- {cat_short} -- {} new stocks",
-                            top.symbol, top.scanner_hits, new_syms.len()
-                        );
-                    }
-                }
-
-            }
-            BgMessage::EnrichComplete { symbol, data } => {
-                // Do NOT toggle bg_busy — enrichment is independent
-                // Update Supabase with enrichment data
-                if let Some(ref mut db) = self.db {
-                    let supa_data = serde_json::json!({
-                        "name": &data.name,
-                        "sector": &data.sector,
-                        "catalyst": &data.catalyst,
-                        "float_shares": data.float_shares,
-                    });
-                    let batch: HashMap<String, (serde_json::Value, Vec<String>)> =
-                        [(symbol.clone(), (supa_data, vec![]))].into_iter().collect();
-                    let _ = rt.block_on(db.record_stocks_batch(&batch));
-                }
-                if let Some(row) = self.alert_rows.iter_mut().find(|r| r.symbol == symbol) {
-                    row.name = data.name;
-                    row.sector = data.sector;
-                    row.industry = data.industry;
-                    row.float_shares = data.float_shares;
-                    row.short_pct = data.short_pct;
-                    row.catalyst = data.catalyst;
-                    row.news_headlines = data.news_headlines;
-                    row.avg_volume = data.avg_volume;
-                    if let (Some(vol), Some(avg)) = (row.volume, data.avg_volume) {
-                        if avg > 0 {
-                            row.rvol = Some(vol as f64 / avg as f64);
-                        }
-                    }
-                    row.enriched = true;
-                }
-            }
-        }
-    }
-
     fn cmd_history(&mut self, args: &[&str], rt: &tokio::runtime::Handle) {
-        let db = match &self.db {
+        let db = match &self.engine.db {
             Some(db) => db,
             None => {
                 self.push_output("Supabase not connected");
@@ -632,14 +267,20 @@ impl App {
             return;
         }
 
-        let (stocks, label) = if args.first().map(|s| s.to_lowercase()) == Some("all".to_string())
-        {
-            (rt.block_on(db.get_history(500)).unwrap_or_default(), "All history")
-        } else if let Some(n) = args.first().and_then(|s| s.parse::<u32>().ok()) {
-            (rt.block_on(db.get_history(n)).unwrap_or_default(), "Last N")
-        } else {
-            (rt.block_on(db.get_today()).unwrap_or_default(), "Today")
-        };
+        let (stocks, label) =
+            if args.first().map(|s| s.to_lowercase()) == Some("all".to_string()) {
+                (
+                    rt.block_on(db.get_history(500)).unwrap_or_default(),
+                    "All history",
+                )
+            } else if let Some(n) = args.first().and_then(|s| s.parse::<u32>().ok()) {
+                (
+                    rt.block_on(db.get_history(n)).unwrap_or_default(),
+                    "Last N",
+                )
+            } else {
+                (rt.block_on(db.get_today()).unwrap_or_default(), "Today")
+            };
 
         if stocks.is_empty() {
             self.push_output(&format!("{label}: no stocks in history"));
@@ -655,12 +296,25 @@ impl App {
 
         for s in &stocks {
             let time_str = crate::history::local_time_str(&s.first_seen);
-            let price = s.last_price.map(|p| format!("{p:.2}")).unwrap_or("-".into());
-            let chg = s.change_pct.map(|c| format!("{c:+.1}%")).unwrap_or("-".into());
-            let rvol = s.rvol.map(|r| format!("{r:.1}x")).unwrap_or("-".into());
+            let price = s
+                .last_price
+                .map(|p| format!("{p:.2}"))
+                .unwrap_or("-".into());
+            let chg = s
+                .change_pct
+                .map(|c| format!("{c:+.1}%"))
+                .unwrap_or("-".into());
+            let rvol = s
+                .rvol
+                .map(|r| format!("{r:.1}x"))
+                .unwrap_or("-".into());
             let hits = s.hit_count.unwrap_or(0);
             let cat = s.catalyst.as_deref().unwrap_or("");
-            let cat = if cat.len() > 30 { format!("{}..", &cat[..28]) } else { cat.to_string() };
+            let cat = if cat.len() > 30 {
+                format!("{}..", &cat[..28])
+            } else {
+                cat.to_string()
+            };
             self.push_output(&format!(
                 "{:<10}  {:<6}  {:>8}  {:>8}  {:>6}  {:<30}  {:>4}  {}",
                 time_str, s.symbol, price, chg, rvol, s.scanners, hits, cat
@@ -679,18 +333,18 @@ impl App {
         let val = args[1];
 
         match key.as_str() {
-            "host" => self.settings.host = val.to_string(),
+            "host" => self.engine.settings.host = val.to_string(),
             "port" => {
-                self.settings.port = val.parse().ok();
+                self.engine.settings.port = val.parse().ok();
             }
             "rows" => {
-                self.settings.rows = val.parse().unwrap_or(self.settings.rows);
+                self.engine.settings.rows = val.parse().unwrap_or(self.engine.settings.rows);
             }
             "minprice" => {
-                self.settings.min_price = val.parse().ok();
+                self.engine.settings.min_price = val.parse().ok();
             }
             "maxprice" => {
-                self.settings.max_price = if val.to_lowercase() == "none" {
+                self.engine.settings.max_price = if val.to_lowercase() == "none" {
                     None
                 } else {
                     val.parse().ok()
@@ -710,23 +364,32 @@ impl App {
         self.push_output("Settings:");
         self.push_output(&format!(
             "  port      = {}",
-            self.settings
+            self.engine
+                .settings
                 .port
                 .map(|p| p.to_string())
                 .unwrap_or("auto".to_string())
         ));
-        self.push_output(&format!("  host      = {}", self.settings.host));
-        self.push_output(&format!("  rows      = {}", self.settings.rows));
+        self.push_output(&format!(
+            "  host      = {}",
+            self.engine.settings.host
+        ));
+        self.push_output(&format!(
+            "  rows      = {}",
+            self.engine.settings.rows
+        ));
         self.push_output(&format!(
             "  minprice  = {}",
-            self.settings
+            self.engine
+                .settings
                 .min_price
                 .map(|p| p.to_string())
                 .unwrap_or("none".to_string())
         ));
         self.push_output(&format!(
             "  maxprice  = {}",
-            self.settings
+            self.engine
+                .settings
                 .max_price
                 .map(|p| p.to_string())
                 .unwrap_or("none".to_string())
@@ -763,12 +426,160 @@ impl App {
             }
         }
     }
+
+    /// Translate engine events into TUI state updates.
+    fn handle_engine_event(&mut self, event: EngineEvent) {
+        match event {
+            EngineEvent::ScanComplete {
+                scanner_code,
+                results,
+            } => {
+                self.clear_output();
+                if results.is_empty() {
+                    self.push_output("No results.");
+                    self.alert_line = format!("{scanner_code} -- 0 results");
+                } else {
+                    self.push_output(&format!(
+                        "{:>3}  {:<6}  {:>8}  {:>8}  {:>12}  {:>6}  {:>8}  {:>7}  {:<20}  {:<14}  {}",
+                        "#", "Symbol", "Last", "Chg%", "Volume", "RVol", "Float", "Short%", "Name", "Sector", "Catalyst"
+                    ));
+                    self.push_output(&"-".repeat(120));
+
+                    for r in &results {
+                        use crate::scanner::*;
+                        let name = r.name.as_deref().unwrap_or("-");
+                        let sector = r.sector.as_deref().unwrap_or("-");
+                        let catalyst = r.catalyst.as_deref().unwrap_or("");
+                        self.push_output(&format!(
+                            "{:>3}  {:<6}  {:>8}  {:>8}  {:>12}  {:>6}  {:>8}  {:>7}  {:<20}  {:<14}  {}",
+                            r.rank,
+                            r.symbol,
+                            fmt_price(r.last),
+                            fmt_change_pct(r.change_pct),
+                            fmt_volume(r.volume),
+                            fmt_rvol(r.rvol),
+                            fmt_float(r.float_shares),
+                            fmt_short_pct(r.short_pct),
+                            truncate(name, 20),
+                            truncate(sector, 14),
+                            truncate(catalyst, 30),
+                        ));
+                    }
+                    self.push_output(&format!("\nTotal: {} stocks", results.len()));
+                    let now = chrono::Local::now().format("%H:%M:%S");
+                    self.alert_line =
+                        format!("[{now}] {scanner_code} -- {} results", results.len());
+                }
+            }
+            EngineEvent::ListComplete { xml, group } => {
+                self.clear_output();
+                match xml {
+                    Some(xml) => {
+                        let tree = tws::group_scans(&xml);
+                        let total: usize = tree
+                            .values()
+                            .flat_map(|cats| cats.values().map(|s| s.len()))
+                            .sum();
+
+                        if let Some(query) = group {
+                            let query_lower = query.to_lowercase();
+                            for inst in tree.keys() {
+                                for (cat, entries) in &tree[inst] {
+                                    if cat.to_lowercase().contains(&query_lower) {
+                                        self.push_output(&format!(
+                                            "{inst} > {cat} ({} scanners)",
+                                            entries.len()
+                                        ));
+                                        self.push_output(&format!(
+                                            "{:<30}  {}",
+                                            "Scanner Code", "Description"
+                                        ));
+                                        self.push_output(&"-".repeat(60));
+                                        let mut sorted = entries.clone();
+                                        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+                                        for (code, disp) in &sorted {
+                                            self.push_output(&format!("{code:<30}  {disp}"));
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            self.push_output(&format!("No group matching '{query}'"));
+                        } else {
+                            self.push_output(&format!("Scanners -- {total} total"));
+                            self.push_output(&format!(
+                                "{:<20}  {:<30}  {:>5}",
+                                "Instrument", "Category", "Count"
+                            ));
+                            self.push_output(&"-".repeat(60));
+                            let mut instruments: Vec<_> = tree.keys().collect();
+                            instruments.sort();
+                            for inst in instruments {
+                                let cats = &tree[inst];
+                                let mut cat_names: Vec<_> = cats.keys().collect();
+                                cat_names.sort();
+                                let mut first = true;
+                                for cat in cat_names {
+                                    let count = cats[cat].len();
+                                    let inst_col = if first { inst.as_str() } else { "" };
+                                    self.push_output(&format!(
+                                        "{inst_col:<20}  {cat:<30}  {count:>5}"
+                                    ));
+                                    first = false;
+                                }
+                            }
+                            self.push_output("\nUse 'list <group>' to expand a category.");
+                        }
+                    }
+                    None => {
+                        self.push_output("Could not connect to TWS");
+                    }
+                }
+            }
+            EngineEvent::PollCycleComplete {
+                total_stocks,
+                new_symbols,
+            } => {
+                let now = chrono::Local::now().format("%H:%M:%S");
+                if new_symbols.is_empty() {
+                    self.alert_line = format!(
+                        "[{now}] Polling -- {} stocks, no new alerts (seen {})",
+                        total_stocks,
+                        self.engine.alert_seen.len()
+                    );
+                } else {
+                    // Set alert line to top alert
+                    if let Some(top) = self.engine.alert_rows.first() {
+                        let chg = top.change_pct.unwrap_or(0.0);
+                        let rvol = top.rvol.unwrap_or(0.0);
+                        let cat = top.catalyst.as_deref().unwrap_or("");
+                        let cat_short = if cat.len() > 30 {
+                            format!("{}..", &cat[..28])
+                        } else {
+                            cat.to_string()
+                        };
+                        self.alert_line = format!(
+                            "[{now}] ALERT: {} +{chg:.1}% RVol {rvol:.1}x ({} scanners) -- {cat_short} -- {} new stocks",
+                            top.symbol, top.scanner_hits, new_symbols.len()
+                        );
+                    }
+                }
+            }
+            EngineEvent::EnrichComplete { .. } => {
+                // Engine already updated alert_rows — nothing to do
+            }
+            EngineEvent::PortDiscovered { .. } => {
+                self.update_title();
+            }
+        }
+    }
 }
 
 /// Run the TUI application. Creates its own tokio runtime for async ops.
 pub fn run_tui() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let handle = rt.handle().clone();
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -776,50 +587,35 @@ pub fn run_tui() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create enrichment worker
-    let (enrich_tx, enrich_rx) = mpsc::channel::<EnrichRequest>();
-
-    // Create app
-    let mut app = App::new(enrich_tx);
+    // Create enrich channel first, then engine, then spawn worker with engine's bg_tx
+    let (enrich_tx, enrich_rx) = std::sync::mpsc::channel::<crate::engine::EnrichRequest>();
 
     // Try to connect to Supabase
     crate::config::load_env();
-    if let Ok(config) = SupabaseConfig::from_env() {
-        app.db = Some(SupabaseClient::new(config));
+    let db = if let Ok(config) = SupabaseConfig::from_env() {
         info!("Connected to Supabase");
-    }
+        Some(SupabaseClient::new(config))
+    } else {
+        None
+    };
 
-    // Probe TWS to discover the connected port
+    let mut app = App::new(AlertEngine::new(enrich_tx, Settings::default(), db));
+
+    // Spawn enrichment worker with the engine's bg_tx
     {
-        let ports: Vec<u16> = app
-            .settings
-            .port
-            .map(|p| vec![p])
-            .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-        if let Ok(client) = tws::TwsClient::connect(&app.settings.host, &ports, 0) {
-            app.connected_port = Some(client.connected_port);
-            client.disconnect();
-        }
-    }
-
-    app.update_title();
-
-    // Spawn enrichment worker thread
-    {
-        let bg_tx = app.bg_tx.clone();
+        let bg_tx = app.engine.bg_tx.clone();
         let rt_handle = handle.clone();
         std::thread::spawn(move || {
             let client = reqwest::Client::new();
-            let mut heap = BinaryHeap::<EnrichRequest>::new();
-            let mut enriched_set = HashSet::<String>::new();
+            let mut heap =
+                std::collections::BinaryHeap::<crate::engine::EnrichRequest>::new();
+            let mut enriched_set = std::collections::HashSet::<String>::new();
 
             loop {
-                // Drain all pending requests into the priority queue
                 loop {
                     match enrich_rx.try_recv() {
                         Ok(req) => {
                             if req.symbol.is_empty() {
-                                // Sentinel: clear enriched set
                                 enriched_set.clear();
                                 heap.clear();
                                 continue;
@@ -833,19 +629,18 @@ pub fn run_tui() -> Result<()> {
                     }
                 }
 
-                // Process highest-priority item
                 if let Some(req) = heap.pop() {
                     if enriched_set.contains(&req.symbol) {
                         continue;
                     }
                     enriched_set.insert(req.symbol.clone());
-                    let data = rt_handle.block_on(fetch_enrichment(&client, &req.symbol));
-                    let _ = bg_tx.send(BgMessage::EnrichComplete {
+                    let data = rt_handle
+                        .block_on(crate::enrichment::fetch_enrichment(&client, &req.symbol));
+                    let _ = bg_tx.send(crate::engine::BgMessage::EnrichComplete {
                         symbol: req.symbol,
                         data,
                     });
                 } else {
-                    // Nothing to do — block until a request arrives
                     match enrich_rx.recv_timeout(Duration::from_secs(1)) {
                         Ok(req) => {
                             if req.symbol.is_empty() {
@@ -862,38 +657,12 @@ pub fn run_tui() -> Result<()> {
         });
     }
 
+    // Probe TWS port
+    app.engine.probe_port();
+    app.update_title();
+
     // Initialize alerts from today's sightings
-    if let Some(ref db) = app.db {
-        if let Ok(today) = handle.block_on(db.get_today()) {
-            for s in &today {
-                app.alert_seen.insert(s.symbol.clone());
-                let scanners_str = &s.scanners;
-                let n_scans = scanners_str.split(',').count() as u32;
-                let has_enrichment = s.name.is_some() || s.catalyst.is_some();
-                app.alert_rows.push(AlertRow {
-                    symbol: s.symbol.clone(),
-                    alert_time: crate::history::local_time_str(&s.first_seen),
-                    last: s.last_price,
-                    change_pct: s.change_pct,
-                    volume: None,
-                    rvol: s.rvol,
-                    float_shares: s.float_shares,
-                    short_pct: None,
-                    name: s.name.clone(),
-                    sector: s.sector.clone(),
-                    industry: None,
-                    catalyst: s.catalyst.clone(),
-                    scanner_hits: n_scans,
-                    news_headlines: Vec::new(),
-                    enriched: has_enrichment,
-                    avg_volume: None,
-                });
-                if !has_enrichment {
-                    app.queue_enrich(&s.symbol, n_scans);
-                }
-            }
-        }
-    }
+    app.engine.init_from_sightings(&handle);
 
     // Main event loop
     let mut poll_timer = std::time::Instant::now();
@@ -951,7 +720,8 @@ pub fn run_tui() -> Result<()> {
                                 app.history_idx -= 1;
                             }
                             if app.history_idx >= 0 {
-                                app.input = app.command_history[app.history_idx as usize].clone();
+                                app.input =
+                                    app.command_history[app.history_idx as usize].clone();
                                 app.input_cursor = app.input.len();
                             }
                         }
@@ -975,7 +745,7 @@ pub fn run_tui() -> Result<()> {
                         }
                     }
                     KeyCode::Down if app.mode == Mode::Alert => {
-                        if app.selected_alert_row + 1 < app.alert_rows.len() {
+                        if app.selected_alert_row + 1 < app.engine.alert_rows.len() {
                             app.selected_alert_row += 1;
                         }
                     }
@@ -990,15 +760,19 @@ pub fn run_tui() -> Result<()> {
             }
         }
 
-        // Check for background task completion
-        while let Ok(msg) = app.bg_rx.try_recv() {
-            app.handle_bg_message(msg, &handle);
+        // Drain engine events
+        let events = app.engine.tick(&handle);
+        for event in events {
+            app.handle_engine_event(event);
         }
 
         // Check poll timer
-        if app.polling && !app.bg_busy && poll_timer.elapsed() >= Duration::from_secs(60) {
+        if app.engine.polling
+            && !app.engine.bg_busy
+            && poll_timer.elapsed() >= Duration::from_secs(60)
+        {
             poll_timer = std::time::Instant::now();
-            app.run_poll_scanners(&handle);
+            app.engine.run_poll_scanners();
         }
 
         if app.should_quit {
@@ -1020,26 +794,29 @@ mod tests {
 
     fn new_app() -> App {
         let (tx, _rx) = mpsc::channel();
-        App::new(tx)
+        App::new(AlertEngine::new(tx, Settings::default(), None))
     }
 
     fn app_with_rt() -> (App, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (tx, _rx) = mpsc::channel();
-        (App::new(tx), rt)
+        (
+            App::new(AlertEngine::new(tx, Settings::default(), None)),
+            rt,
+        )
     }
 
     #[test]
     fn test_app_initial_state() {
         let app = new_app();
         assert_eq!(app.mode, Mode::Alert);
-        assert!(app.alert_rows.is_empty());
-        assert!(app.alert_seen.is_empty());
+        assert!(app.engine.alert_rows.is_empty());
+        assert!(app.engine.alert_seen.is_empty());
         assert!(app.output_lines.is_empty());
         assert!(!app.should_quit);
-        assert!(!app.polling);
-        assert_eq!(app.settings.host, "127.0.0.1");
-        assert_eq!(app.settings.rows, 25);
+        assert!(!app.engine.polling);
+        assert_eq!(app.engine.settings.host, "127.0.0.1");
+        assert_eq!(app.engine.settings.rows, 25);
     }
 
     #[test]
@@ -1081,7 +858,10 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("foobar", &handle);
-        assert!(app.output_lines.iter().any(|l| l.contains("Unknown command")));
+        assert!(app
+            .output_lines
+            .iter()
+            .any(|l| l.contains("Unknown command")));
     }
 
     #[test]
@@ -1089,7 +869,7 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set host 192.168.1.1", &handle);
-        assert_eq!(app.settings.host, "192.168.1.1");
+        assert_eq!(app.engine.settings.host, "192.168.1.1");
     }
 
     #[test]
@@ -1097,7 +877,7 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set port 7497", &handle);
-        assert_eq!(app.settings.port, Some(7497));
+        assert_eq!(app.engine.settings.port, Some(7497));
     }
 
     #[test]
@@ -1105,7 +885,7 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set rows 50", &handle);
-        assert_eq!(app.settings.rows, 50);
+        assert_eq!(app.engine.settings.rows, 50);
     }
 
     #[test]
@@ -1113,7 +893,7 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set minprice 2.5", &handle);
-        assert_eq!(app.settings.min_price, Some(2.5));
+        assert_eq!(app.engine.settings.min_price, Some(2.5));
     }
 
     #[test]
@@ -1121,16 +901,16 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set maxprice 15", &handle);
-        assert_eq!(app.settings.max_price, Some(15.0));
+        assert_eq!(app.engine.settings.max_price, Some(15.0));
     }
 
     #[test]
     fn test_set_maxprice_none() {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
-        app.settings.max_price = Some(20.0);
+        app.engine.settings.max_price = Some(20.0);
         app.handle_input("set maxprice none", &handle);
-        assert_eq!(app.settings.max_price, None);
+        assert_eq!(app.engine.settings.max_price, None);
     }
 
     #[test]
@@ -1138,7 +918,10 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("set foobar 123", &handle);
-        assert!(app.output_lines.iter().any(|l| l.contains("Unknown setting")));
+        assert!(app
+            .output_lines
+            .iter()
+            .any(|l| l.contains("Unknown setting")));
     }
 
     #[test]
@@ -1157,7 +940,10 @@ mod tests {
         let handle = rt.handle().clone();
         app.handle_input("aliases", &handle);
         assert!(app.output_lines.iter().any(|l| l.contains("gain")));
-        assert!(app.output_lines.iter().any(|l| l.contains("TOP_PERC_GAIN")));
+        assert!(app
+            .output_lines
+            .iter()
+            .any(|l| l.contains("TOP_PERC_GAIN")));
     }
 
     #[test]
@@ -1197,11 +983,11 @@ mod tests {
     fn test_poll_clear() {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
-        app.alert_seen.insert("AAPL".to_string());
-        app.alert_seen.insert("TSLA".to_string());
+        app.engine.alert_seen.insert("AAPL".to_string());
+        app.engine.alert_seen.insert("TSLA".to_string());
         app.handle_input("poll clear", &handle);
-        assert!(app.alert_seen.is_empty());
-        assert!(app.alert_rows.is_empty());
+        assert!(app.engine.alert_seen.is_empty());
+        assert!(app.engine.alert_rows.is_empty());
     }
 
     #[test]
@@ -1266,7 +1052,7 @@ mod tests {
     #[test]
     fn test_update_title_with_port() {
         let mut app = new_app();
-        app.connected_port = Some(7500);
+        app.engine.connected_port = Some(7500);
         app.update_title();
         assert!(app.title.contains("7500"));
     }
@@ -1283,37 +1069,19 @@ mod tests {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
         app.handle_input("history", &handle);
-        assert!(app.output_lines.iter().any(|l| l.contains("Supabase not connected")));
-    }
-
-    #[test]
-    fn test_enrich_request_priority_ordering() {
-        let low = EnrichRequest { symbol: "LOW".to_string(), scanner_hits: 1 };
-        let mid = EnrichRequest { symbol: "MID".to_string(), scanner_hits: 4 };
-        let high = EnrichRequest { symbol: "HIGH".to_string(), scanner_hits: 8 };
-        // Higher scanner_hits = higher priority
-        assert!(high > mid);
-        assert!(mid > low);
-        assert!(high > low);
-
-        // BinaryHeap pops highest first
-        let mut heap = BinaryHeap::new();
-        heap.push(low);
-        heap.push(high);
-        heap.push(mid);
-        assert_eq!(heap.pop().unwrap().symbol, "HIGH");
-        assert_eq!(heap.pop().unwrap().symbol, "MID");
-        assert_eq!(heap.pop().unwrap().symbol, "LOW");
+        assert!(app
+            .output_lines
+            .iter()
+            .any(|l| l.contains("Supabase not connected")));
     }
 
     #[test]
     fn test_enrichment_data_news_headlines() {
-        let data = EnrichmentData {
+        let data = crate::enrichment::EnrichmentData {
             news_headlines: vec!["Headline 1".to_string(), "Headline 2".to_string()],
             ..Default::default()
         };
         assert_eq!(data.news_headlines.len(), 2);
         assert_eq!(data.news_headlines[0], "Headline 1");
     }
-
 }

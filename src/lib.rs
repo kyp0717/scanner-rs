@@ -1,5 +1,7 @@
 pub mod catalyst;
+pub mod cli;
 pub mod config;
+pub mod engine;
 pub mod enrichment;
 pub mod error;
 pub mod history;

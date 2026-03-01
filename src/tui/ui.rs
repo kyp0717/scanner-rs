@@ -92,7 +92,7 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_alert_table(f: &mut Frame, area: Rect, app: &App) {
-    if app.alert_rows.is_empty() {
+    if app.engine.alert_rows.is_empty() {
         let msg = Paragraph::new("No alerts yet. Press Insert for scan mode.")
             .style(Style::default().fg(Color::DarkGray).bg(Color::Black));
         f.render_widget(msg, area);
@@ -114,6 +114,7 @@ fn draw_alert_table(f: &mut Frame, area: Rect, app: &App) {
     );
 
     let rows: Vec<Row> = app
+        .engine
         .alert_rows
         .iter()
         .enumerate()
@@ -187,14 +188,14 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
     let label_style = Style::default().fg(Color::Yellow);
     let val_style = Style::default().fg(Color::White);
 
-    if app.alert_rows.is_empty() || app.selected_alert_row >= app.alert_rows.len() {
+    if app.engine.alert_rows.is_empty() || app.selected_alert_row >= app.engine.alert_rows.len() {
         let msg = Paragraph::new("No stock selected")
             .style(Style::default().fg(Color::DarkGray).bg(Color::Black));
         f.render_widget(msg, area);
         return;
     }
 
-    let r = &app.alert_rows[app.selected_alert_row];
+    let r = &app.engine.alert_rows[app.selected_alert_row];
     let mut lines: Vec<Line> = Vec::new();
 
     // Symbol header

@@ -1,13 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use scanner_rs::config::{self, SupabaseConfig};
-use scanner_rs::enrichment;
-use scanner_rs::history::{self, SupabaseClient};
-use scanner_rs::models::{self, DEFAULT_PORTS};
-use scanner_rs::scanner;
+use scanner_rs::cli;
+use scanner_rs::config;
 use scanner_rs::tui;
-use scanner_rs::tws;
 
 #[derive(Parser)]
 #[command(name = "scanner", about = "TWS Momentum Stock Scanner")]
@@ -69,6 +65,18 @@ enum Commands {
     },
     /// Launch the interactive TUI
     Tui,
+    /// Stream momentum alerts to stdout (headless mode)
+    Alert {
+        /// TWS host
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TWS port (auto-detects 7500/7497 if omitted)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Output alerts as JSON lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
@@ -92,12 +100,17 @@ fn main() -> Result<()> {
     let _guard = init_logging();
     config::load_env();
 
-    let cli = Cli::parse();
+    let cli_args = Cli::parse();
 
-    match cli.command {
+    match cli_args.command {
         // TUI mode: runs its own tokio runtime internally
         Some(Commands::Tui) | None => {
             tui::run_tui()?;
+        }
+
+        // Alert mode: runs its own tokio runtime internally
+        Some(Commands::Alert { host, port, json }) => {
+            cli::run_alert(&host, port, json)?;
         }
 
         // All other commands use a tokio runtime
@@ -121,121 +134,26 @@ async fn run_command(cmd: Commands) -> Result<()> {
             max_price,
             list: _,
         } => {
-            let scanner_code = models::resolve_scanner(&code);
-            let ports: Vec<u16> = port.map(|p| vec![p]).unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-
-            if code.to_lowercase() == "list" {
-                match tws::fetch_scanner_params(&host, &ports, 3) {
-                    Some(xml) => tws::print_scanner_params(&xml, None),
-                    None => eprintln!("Could not connect to TWS"),
-                }
-                return Ok(());
-            }
-
-            let (mut results, _port) =
-                tws::run_scan(&scanner_code, &host, &ports, 1, rows, Some(min_price), max_price);
-
-            if !results.is_empty() {
-                println!("Enriching with Yahoo Finance...");
-                enrichment::enrich_results(&mut results).await;
-            }
-
-            scanner::print_results(&results);
+            cli::cmd_scan(&code, &host, port, rows, min_price, max_price).await?;
         }
 
         Commands::List { group, host, port } => {
-            let ports: Vec<u16> = port.map(|p| vec![p]).unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-            match tws::fetch_scanner_params(&host, &ports, 3) {
-                Some(xml) => tws::print_scanner_params(&xml, group.as_deref()),
-                None => eprintln!("Could not connect to TWS"),
-            }
+            cli::cmd_list(group.as_deref(), &host, port).await?;
         }
 
         Commands::History { what } => {
-            let config = SupabaseConfig::from_env()?;
-            let db = SupabaseClient::new(config);
-
-            match what.as_deref() {
-                Some("clear") => {
-                    let count = db.clear_history().await?;
-                    println!("Cleared {count} stocks from history");
-                }
-                Some("all") => {
-                    let stocks = db.get_history(500).await?;
-                    history::print_history(&stocks, "All history");
-                }
-                Some("today") | None => {
-                    let stocks = db.get_today().await?;
-                    history::print_history(&stocks, "Today");
-                }
-                Some(n) => {
-                    if let Ok(limit) = n.parse::<u32>() {
-                        let stocks = db.get_history(limit).await?;
-                        history::print_history(&stocks, &format!("Last {limit}"));
-                    } else {
-                        eprintln!("Usage: scanner history [today|all|clear|N]");
-                    }
-                }
-            }
+            cli::cmd_history(what.as_deref()).await?;
         }
 
         Commands::Enrich { symbols } => {
-            if symbols.is_empty() {
-                eprintln!("Usage: scanner enrich AAPL TSLA ...");
-                return Ok(());
-            }
-
-            let client = reqwest::Client::new();
-            for sym in &symbols {
-                println!("Enriching {sym}...");
-                let data = enrichment::fetch_enrichment(&client, sym).await;
-                println!("  Name:        {}", data.name.as_deref().unwrap_or("-"));
-                println!("  Sector:      {}", data.sector.as_deref().unwrap_or("-"));
-                println!("  Industry:    {}", data.industry.as_deref().unwrap_or("-"));
-                println!(
-                    "  Float:       {}",
-                    data.float_shares
-                        .map(|f| format!("{:.1}M", f / 1e6))
-                        .unwrap_or("-".into())
-                );
-                println!(
-                    "  Short%:      {}",
-                    data.short_pct
-                        .map(|p| format!("{:.1}%", p * 100.0))
-                        .unwrap_or("-".into())
-                );
-                println!(
-                    "  Avg Volume:  {}",
-                    data.avg_volume
-                        .map(|v| format!("{v}"))
-                        .unwrap_or("-".into())
-                );
-                println!(
-                    "  Catalyst:    {}",
-                    data.catalyst.as_deref().unwrap_or("none")
-                );
-                println!();
-            }
+            cli::cmd_enrich(&symbols).await?;
         }
 
         Commands::Config { what: _ } => {
-            println!("Configuration:");
-            println!(
-                "  SUPABASE_URL = {}",
-                std::env::var("SUPABASE_URL").unwrap_or_else(|_| "(not set)".into())
-            );
-            println!(
-                "  SUPABASE_ANON_KEY = {}",
-                if std::env::var("SUPABASE_ANON_KEY").is_ok() {
-                    "(set)"
-                } else {
-                    "(not set)"
-                }
-            );
-            println!("  Default ports: {:?}", DEFAULT_PORTS);
+            cli::cmd_config();
         }
 
-        Commands::Tui => unreachable!(),
+        Commands::Tui | Commands::Alert { .. } => unreachable!(),
     }
 
     Ok(())

@@ -49,7 +49,7 @@ impl TwsClient {
                     match Self::handshake(stream, client_id, port) {
                         Ok(client) => {
                             info!("Connected to TWS on port {port}");
-                            println!("Connected to TWS on port {port}");
+                            eprintln!("Connected to TWS on port {port}");
                             return Ok(client);
                         }
                         Err(e) => {
@@ -233,7 +233,7 @@ impl TwsClient {
             // scannerDataEnd signal
             let mut s = state.lock().unwrap();
             let count = s.results.len();
-            println!("Found {count} stocks, fetching market data...\n");
+            eprintln!("Found {count} stocks, fetching market data...");
             s.scanner_done = true;
             return;
         }
@@ -610,7 +610,7 @@ pub fn run_scan(
     min_price: Option<f64>,
     max_price: Option<f64>,
 ) -> (Vec<ScanResult>, Option<u16>) {
-    println!("\nScanning {scanner_code} (rows={rows})...\n");
+    eprintln!("Scanning {scanner_code} (rows={rows})...");
 
     let mut client = match TwsClient::connect(host, ports, client_id) {
         Ok(c) => c,
@@ -641,7 +641,7 @@ pub fn run_scan(
     }
 
     // Request market data for all results
-    println!("Waiting for market data...");
+    eprintln!("Waiting for market data...");
     if let Err(e) = client.request_market_data() {
         eprintln!("Failed to request market data: {e}");
     }
