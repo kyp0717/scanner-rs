@@ -279,9 +279,11 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                 EngineEvent::PollCycleComplete {
                     total_stocks,
                     new_symbols,
+                    scanners_run,
+                    elapsed_secs,
                 } => {
                     log_alert(json, &format!(
-                        "Poll cycle complete: {total_stocks} stocks scanned, {} new alerts (total seen: {})",
+                        "Poll cycle complete: {scanners_run} scanners, {total_stocks} stocks, {} new alerts in {elapsed_secs:.1}s (total seen: {})",
                         new_symbols.len(),
                         engine.alert_seen.len()
                     ));

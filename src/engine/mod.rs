@@ -24,6 +24,8 @@ pub enum BgMessage {
         symbol_data: HashMap<String, ScanResult>,
         symbol_scanners: HashMap<String, Vec<String>>,
         port: Option<u16>,
+        scanners_run: usize,
+        elapsed_secs: f64,
     },
     EnrichComplete {
         symbol: String,
@@ -63,6 +65,8 @@ pub enum EngineEvent {
     PollCycleComplete {
         total_stocks: usize,
         new_symbols: Vec<String>,
+        scanners_run: usize,
+        elapsed_secs: f64,
     },
     EnrichComplete {
         symbol: String,
@@ -212,9 +216,11 @@ impl AlertEngine {
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
+            let start = std::time::Instant::now();
             let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
             let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
             let mut connected_port = None;
+            let mut scanners_run = 0usize;
 
             for (i, &(code, cid)) in ALERT_SCANNERS.iter().enumerate() {
                 let (results, port) =
@@ -223,6 +229,7 @@ impl AlertEngine {
                     connected_port = port;
                 }
                 let count = results.len();
+                scanners_run += 1;
 
                 for r in results {
                     let sym = r.symbol.clone();
@@ -235,12 +242,15 @@ impl AlertEngine {
                 info!(scanner = i + 1, total = ALERT_SCANNERS.len(), code, count, "scanner results");
             }
 
-            info!(unique_stocks = symbol_data.len(), scanners = ALERT_SCANNERS.len(), "poll scan complete");
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            info!(unique_stocks = symbol_data.len(), scanners_run, elapsed_secs, "poll scan complete");
 
             let _ = tx.send(BgMessage::PollComplete {
                 symbol_data,
                 symbol_scanners,
                 port: connected_port,
+                scanners_run,
+                elapsed_secs,
             });
         });
     }
@@ -278,6 +288,8 @@ impl AlertEngine {
                     symbol_data,
                     symbol_scanners,
                     port,
+                    scanners_run,
+                    elapsed_secs,
                 } => {
                     if let Some(p) = port {
                         self.connected_port = Some(p);
@@ -370,6 +382,8 @@ impl AlertEngine {
                     events.push(EngineEvent::PollCycleComplete {
                         total_stocks,
                         new_symbols: new_syms,
+                        scanners_run,
+                        elapsed_secs,
                     });
                 }
                 BgMessage::EnrichComplete { symbol, data } => {

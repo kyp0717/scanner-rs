@@ -539,6 +539,7 @@ impl App {
             EngineEvent::PollCycleComplete {
                 total_stocks,
                 new_symbols,
+                ..
             } => {
                 let now = chrono::Local::now().format("%H:%M:%S");
                 if new_symbols.is_empty() {

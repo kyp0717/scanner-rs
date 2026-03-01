@@ -80,29 +80,26 @@ impl TwsClient {
         writer.write_all(&handshake)?;
         writer.flush()?;
 
-        // Read server version response (not length-prefixed, just raw text until \0)
+        // Read server response: 4-byte big-endian length prefix, then payload
         let mut reader = BufReader::new(read_stream);
-        let mut byte = [0u8; 1];
-        let mut version_str = String::new();
-        loop {
-            reader.read_exact(&mut byte)?;
-            if byte[0] == 0 {
-                break;
-            }
-            version_str.push(byte[0] as char);
-        }
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; msg_len];
+        reader.read_exact(&mut payload)?;
+
+        // Payload contains null-separated fields: server_version \0 server_time \0
+        let mut fields = payload.split(|&b| b == 0).filter(|f| !f.is_empty());
+        let version_str = fields
+            .next()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let time_str = fields
+            .next()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
         let server_version: i32 = version_str.trim().parse().unwrap_or(0);
         debug!("Server version: {server_version}");
-
-        // Read server time (until \0)
-        let mut time_str = String::new();
-        loop {
-            reader.read_exact(&mut byte)?;
-            if byte[0] == 0 {
-                break;
-            }
-            time_str.push(byte[0] as char);
-        }
         debug!("Server time: {time_str}");
 
         // Send START_API
