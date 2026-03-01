@@ -2,6 +2,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use tracing::{info, warn};
+
 use crate::enrichment::{fetch_enrichment, EnrichmentData};
 use crate::history::SupabaseClient;
 use crate::models::*;
@@ -214,12 +216,13 @@ impl AlertEngine {
             let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
             let mut connected_port = None;
 
-            for &(code, cid) in ALERT_SCANNERS {
+            for (i, &(code, cid)) in ALERT_SCANNERS.iter().enumerate() {
                 let (results, port) =
                     tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
                 if connected_port.is_none() {
                     connected_port = port;
                 }
+                let count = results.len();
 
                 for r in results {
                     let sym = r.symbol.clone();
@@ -229,7 +232,10 @@ impl AlertEngine {
                         .push(code.to_string());
                     symbol_data.entry(sym).or_insert(r);
                 }
+                info!(scanner = i + 1, total = ALERT_SCANNERS.len(), code, count, "scanner results");
             }
+
+            info!(unique_stocks = symbol_data.len(), scanners = ALERT_SCANNERS.len(), "poll scan complete");
 
             let _ = tx.send(BgMessage::PollComplete {
                 symbol_data,
@@ -301,7 +307,10 @@ impl AlertEngine {
                                 )
                             })
                             .collect();
-                        let _ = rt.block_on(db.record_stocks_batch(&batch));
+                        match rt.block_on(db.record_stocks_batch(&batch)) {
+                            Ok(_) => {}
+                            Err(e) => warn!("Supabase write error: {e}"),
+                        }
                     }
 
                     // Detect new symbols
@@ -321,6 +330,8 @@ impl AlertEngine {
                                 .get(sym)
                                 .map(|s| s.len() as u32)
                                 .unwrap_or(0);
+                            let chg = r.change_pct.map(|c| format!("{c:+.1}%")).unwrap_or("-".into());
+                            info!(symbol = %sym, hits, change = %chg, "new alert");
                             self.alert_rows.push(AlertRow {
                                 symbol: sym.clone(),
                                 alert_time: now.clone(),
@@ -374,8 +385,17 @@ impl AlertEngine {
                             [(symbol.clone(), (supa_data, vec![]))]
                                 .into_iter()
                                 .collect();
-                        let _ = rt.block_on(db.record_stocks_batch(&batch));
+                        match rt.block_on(db.record_stocks_batch(&batch)) {
+                            Ok(_) => {}
+                            Err(e) => warn!("Supabase enrich write error: {e}"),
+                        }
                     }
+
+                    let cat = data.catalyst.as_deref().unwrap_or("-");
+                    let float_str = data.float_shares
+                        .map(|f| if f >= 1e9 { format!("{:.1}B", f / 1e9) } else if f >= 1e6 { format!("{:.1}M", f / 1e6) } else { format!("{:.0}", f) })
+                        .unwrap_or("-".into());
+                    info!(symbol = %symbol, catalyst = cat, float = %float_str, "enriched");
 
                     // Update matching AlertRow
                     if let Some(row) =
@@ -419,9 +439,12 @@ impl AlertEngine {
     }
 
     /// Load today's sightings from Supabase and populate alert state.
-    pub fn init_from_sightings(&mut self, rt: &tokio::runtime::Handle) {
+    /// Returns (loaded_count, needs_enrichment_count).
+    pub fn init_from_sightings(&mut self, rt: &tokio::runtime::Handle) -> (usize, usize) {
         if let Some(ref db) = self.db {
             if let Ok(today) = rt.block_on(db.get_today()) {
+                let loaded = today.len();
+                let mut needs_enrich = 0usize;
                 for s in &today {
                     self.alert_seen.insert(s.symbol.clone());
                     let scanners_str = &s.scanners;
@@ -446,11 +469,15 @@ impl AlertEngine {
                         avg_volume: None,
                     });
                     if !has_enrichment {
+                        needs_enrich += 1;
                         self.queue_enrich(&s.symbol, n_scans);
                     }
                 }
+                info!(loaded, needs_enrich, "sightings loaded");
+                return (loaded, needs_enrich);
             }
         }
+        (0, 0)
     }
 }
 

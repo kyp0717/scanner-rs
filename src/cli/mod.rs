@@ -11,6 +11,17 @@ use crate::models::*;
 use crate::scanner;
 use crate::tws;
 
+/// Log a timestamped message. In text mode goes to stdout; in JSON mode goes to stderr.
+fn log_alert(json: bool, msg: &str) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let line = format!("[{ts}] [LOG] {msg}");
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
 /// One-shot scan: connect to TWS, run scanner, enrich, print results.
 pub async fn cmd_scan(
     code: &str,
@@ -175,6 +186,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
     {
         let bg_tx = engine.bg_tx.clone();
         let rt_handle = handle.clone();
+        let json_mode = json;
         std::thread::spawn(move || {
             let client = reqwest::Client::new();
             let mut heap =
@@ -188,6 +200,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                             if req.symbol.is_empty() {
                                 enriched_set.clear();
                                 heap.clear();
+                                log_alert(json_mode, "Enrichment queue cleared");
                                 continue;
                             }
                             if !enriched_set.contains(&req.symbol) {
@@ -203,9 +216,11 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                     if enriched_set.contains(&req.symbol) {
                         continue;
                     }
+                    log_alert(json_mode, &format!("Enriching {} (priority {})...", req.symbol, req.scanner_hits));
                     enriched_set.insert(req.symbol.clone());
                     let data = rt_handle
                         .block_on(crate::enrichment::fetch_enrichment(&client, &req.symbol));
+                    log_alert(json_mode, &format!("Enrichment complete: {}", req.symbol));
                     let _ = bg_tx.send(crate::engine::BgMessage::EnrichComplete {
                         symbol: req.symbol,
                         data,
@@ -215,6 +230,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                         Ok(req) => {
                             if req.symbol.is_empty() {
                                 enriched_set.clear();
+                                log_alert(json_mode, "Enrichment queue cleared");
                             } else if !enriched_set.contains(&req.symbol) {
                                 heap.push(req);
                             }
@@ -227,22 +243,27 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
         });
     }
 
-    eprintln!("Scanner alert mode starting...");
+    let ports_desc = engine.settings.port
+        .map(|p| format!("{p}"))
+        .unwrap_or_else(|| format!("{:?}", DEFAULT_PORTS));
+    log_alert(json, &format!("Probing TWS on ports {ports_desc}..."));
 
     // Probe TWS port
     engine.probe_port();
     if let Some(p) = engine.connected_port {
-        eprintln!("Connected to TWS on port {p}");
+        log_alert(json, &format!("TWS connected on port {p}"));
     } else {
-        eprintln!("Warning: Could not connect to TWS");
+        log_alert(json, "TWS unavailable, alerts will be empty");
     }
 
     // Initialize from sightings
-    engine.init_from_sightings(&handle);
+    log_alert(json, "Loading today's sightings from Supabase...");
+    let (loaded, needs_enrich) = engine.init_from_sightings(&handle);
+    log_alert(json, &format!("Loaded {loaded} stocks from history, {needs_enrich} queued for enrichment"));
 
     // Start polling
     engine.poll_on();
-    eprintln!("Polling started (60s interval). Press Ctrl+C to stop.");
+    log_alert(json, "Starting poll (8 scanners, 60s cycle). Ctrl+C to stop.");
 
     // Setup Ctrl+C handler
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -259,85 +280,77 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                     total_stocks,
                     new_symbols,
                 } => {
-                    if !new_symbols.is_empty() {
-                        for sym in &new_symbols {
-                            if let Some(row) =
-                                engine.alert_rows.iter().find(|r| r.symbol == *sym)
-                            {
-                                if json {
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string(row).unwrap_or_default()
-                                    );
-                                } else {
-                                    let chg = row
-                                        .change_pct
-                                        .map(|c| format!("{c:+.1}%"))
-                                        .unwrap_or("-".into());
-                                    let price = row
-                                        .last
-                                        .map(|p| format!("{p:.2}"))
-                                        .unwrap_or("-".into());
-                                    println!(
-                                        "[{}] ALERT  {:<6}  {:>8}  {:>8}  {}/8 scanners",
-                                        row.alert_time,
-                                        row.symbol,
-                                        price,
-                                        chg,
-                                        row.scanner_hits,
-                                    );
-                                }
+                    log_alert(json, &format!(
+                        "Poll cycle complete: {total_stocks} stocks scanned, {} new alerts (total seen: {})",
+                        new_symbols.len(),
+                        engine.alert_seen.len()
+                    ));
+                    for sym in &new_symbols {
+                        if let Some(row) =
+                            engine.alert_rows.iter().find(|r| r.symbol == *sym)
+                        {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(row).unwrap_or_default()
+                                );
+                            } else {
+                                let chg = row
+                                    .change_pct
+                                    .map(|c| format!("{c:+.1}%"))
+                                    .unwrap_or("-".into());
+                                let price = row
+                                    .last
+                                    .map(|p| format!("{p:.2}"))
+                                    .unwrap_or("-".into());
+                                println!(
+                                    "[{}] [ALERT] {:<6}  ${:>7}  {:>8}  {}/8 scanners",
+                                    row.alert_time,
+                                    row.symbol,
+                                    price,
+                                    chg,
+                                    row.scanner_hits,
+                                );
                             }
                         }
-                    } else {
-                        let now = chrono::Local::now().format("%H:%M:%S");
-                        eprintln!(
-                            "[{now}] Poll complete -- {total_stocks} stocks, no new alerts (seen {})",
-                            engine.alert_seen.len()
-                        );
                     }
                 }
                 EngineEvent::EnrichComplete { ref symbol } => {
-                    if json {
-                        if let Some(row) =
-                            engine.alert_rows.iter().find(|r| r.symbol == *symbol)
-                        {
+                    if let Some(row) =
+                        engine.alert_rows.iter().find(|r| r.symbol == *symbol)
+                    {
+                        let cat = row.catalyst.as_deref().unwrap_or("-");
+                        let name = row.name.as_deref().unwrap_or("-");
+                        let rvol = row
+                            .rvol
+                            .map(|r| format!("{r:.1}x"))
+                            .unwrap_or("-".into());
+                        let float = row
+                            .float_shares
+                            .map(|f| {
+                                if f >= 1e9 {
+                                    format!("{:.1}B", f / 1e9)
+                                } else if f >= 1e6 {
+                                    format!("{:.1}M", f / 1e6)
+                                } else {
+                                    format!("{:.0}", f)
+                                }
+                            })
+                            .unwrap_or("-".into());
+                        log_alert(json, &format!(
+                            "Enriched {}: name={} catalyst={} float={} rvol={}",
+                            symbol, name, cat, float, rvol
+                        ));
+                        if json {
                             println!(
                                 "{}",
                                 serde_json::to_string(row).unwrap_or_default()
                             );
                         }
-                    } else {
-                        if let Some(row) =
-                            engine.alert_rows.iter().find(|r| r.symbol == *symbol)
-                        {
-                            let cat = row.catalyst.as_deref().unwrap_or("-");
-                            let name = row.name.as_deref().unwrap_or("-");
-                            let rvol = row
-                                .rvol
-                                .map(|r| format!("{r:.1}x"))
-                                .unwrap_or("-".into());
-                            let float = row
-                                .float_shares
-                                .map(|f| {
-                                    if f >= 1e9 {
-                                        format!("{:.1}B", f / 1e9)
-                                    } else if f >= 1e6 {
-                                        format!("{:.1}M", f / 1e6)
-                                    } else {
-                                        format!("{:.0}", f)
-                                    }
-                                })
-                                .unwrap_or("-".into());
-                            eprintln!(
-                                "  ENRICH {:<6}  RVol={:<6}  Float={:<8}  Cat={}  Name={}",
-                                symbol, rvol, float, cat, name
-                            );
-                        }
                     }
                 }
                 EngineEvent::PortDiscovered { port } => {
-                    eprintln!("TWS port discovered: {port}");
+                    log_alert(json, &format!("TWS port discovered: {port}"));
                 }
                 _ => {}
             }
@@ -349,13 +362,15 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
             && poll_timer.elapsed() >= Duration::from_secs(60)
         {
             poll_timer = std::time::Instant::now();
+            log_alert(json, "Starting poll cycle...");
             engine.run_poll_scanners();
         }
 
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    eprintln!("\nShutting down...");
+    let alert_count = engine.alert_rows.len();
+    log_alert(json, &format!("Shutting down (seen {} stocks, {} alerts)", engine.alert_seen.len(), alert_count));
     Ok(())
 }
 
