@@ -77,6 +77,7 @@ pub mod tick_type {
     pub const DELAYED_ASK: i32 = 67;
     pub const DELAYED_LAST: i32 = 68;
     pub const DELAYED_CLOSE: i32 = 75;
+    pub const DELAYED_VOLUME: i32 = 87;
 }
 
 /// Non-fatal error codes that are informational.
