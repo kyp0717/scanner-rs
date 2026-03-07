@@ -108,12 +108,28 @@ mode and GUI create an engine and consume the same `EngineEvent` variants:
 - `ScanComplete` — one-shot scan finished
 - `PollCycleComplete` — all 8 scanners polled, new symbols detected
 - `EnrichComplete` — Yahoo Finance data arrived for a symbol
+- `MarketDataTick` — real-time price/volume update from streaming
 - `PortDiscovered` — TWS port auto-detected
 
-Background work (TWS scanning, Yahoo enrichment) runs in OS threads via `mpsc`
-channels. Each thread creates its own `tokio::runtime::Runtime` for async ibapi
-calls. The main thread (CLI loop or GUI event loop) calls `engine.tick()` each
-iteration to drain events without blocking.
+### mpsc Channel Architecture
+All background workers communicate with the engine via `std::sync::mpsc`
+(multi-producer, single-consumer) channels. This is a lock-free, lightweight
+message queue similar to Go channels.
+
+```
+Poll thread ──────────send(PollComplete)──────→ ┌─────────┐
+Enrichment worker ────send(EnrichComplete)────→ │  bg_rx  │ ──tick()──→ Engine
+Market data worker ───send(MarketDataTick)────→ └─────────┘
+```
+
+- **Producers** (3 worker threads): each holds a clone of `bg_tx`
+- **Consumer** (1 main thread): `engine.tick()` drains `bg_rx` via `try_recv()`
+- **Non-blocking**: `try_recv()` returns immediately if empty — no GUI stall
+- **Unbounded**: senders never block (no backpressure needed for this use case)
+
+Additional mpsc channels for worker input:
+- `enrich_tx/rx` — engine sends `EnrichRequest` to enrichment worker
+- `mktdata_tx/rx` — engine sends `MktDataRequest` to market data worker
 
 ## Dependencies
 - `ibapi` — IB TWS API client (scanner subscriptions, connection handling)
@@ -146,7 +162,7 @@ scan <alias|code> [--rows N] [--min-price N] [--max-price N]
 list                    3-level picker: instrument -> category -> scanner
 list <group>            Fuzzy expand category
 poll                    Show polling status
-poll on|off             Start/stop background momentum polling (60s)
+poll on|off             Start/stop background momentum polling (15s)
 poll clear              Clear seen-set (re-alert)
 history                 Show today's tracked stocks
 history all             Show all historical stocks
@@ -201,24 +217,27 @@ If CLI shows "-" or empty data, fix the data layer first — don't debug in the 
 - Engine-level logging uses `tracing::{info, warn}` — not `eprintln!`
 
 ## TWS Connection
-Uses `ibapi` crate for all TWS communication (connection, scanner subscriptions,
-scanner parameters). No hand-rolled protocol code.
+Uses `ibapi` crate (v2.x, async builder API) for all TWS communication
+(connection, scanner subscriptions, scanner parameters, market data streaming).
+No hand-rolled protocol code.
 - Ports: 7500 (paper), 7497 (live) — auto-detect with fallback
-- Client IDs: 1 (interactive), 3 (params), 10-17 (alert scanners)
+- Client IDs: 1 (interactive), 3 (params), 10 (poll scans), 20 (snapshots), 30 (streaming)
 - All tws functions are async; engine threads create local tokio runtimes
 
-### Scanner Data + Market Snapshots
-The IB TWS scanner API (`ibapi::scanner::ScannerData`) only returns **contract
-data** (rank, contract_details, leg) — not market data. For one-shot scans
-(`cargo run -- scan`), `tws::fetch_snapshots()` makes snapshot `market_data`
-requests (one per symbol, max 50, 3s timeout each) to fetch last price, bid,
-ask, volume, and previous close. Change% is computed from last vs close.
-Client ID 20 is used for snapshot connections. **Note:** Snapshots return no
-price data when market is closed — this is expected TWS behavior.
+### Scanner Data + Market Data
+The IB TWS scanner API only returns **contract data** (rank, contract_details)
+— not market data. Price data comes from two sources:
 
-Snapshots are NOT used during poll cycles (too many symbols would block the poll
-thread). Poll alert rows get prices updated when enrichment or future snapshot
-batching is added.
+**One-shot scans** (`cargo run -- scan`): `tws::fetch_snapshots()` fetches
+snapshot market data (concurrent chunks of 10, max 50 symbols, 3s timeout each).
+Client ID 20. **Note:** Snapshots return no data when market is closed.
+
+**Poll cycles** (`alert` / `gui`): No snapshots. Instead, discovered symbols
+are subscribed to **streaming market data** via `spawn_market_data_worker`
+(client ID 30). Each symbol gets an async task that calls
+`client.market_data(&contract).subscribe().await` for continuous price ticks.
+The streaming worker forwards `MarketDataTick` messages to the engine via mpsc,
+giving sub-second price updates. Poll interval is 15 seconds for discovery.
 
 ## Yahoo Finance API (IMPORTANT)
 Yahoo Finance API **requires** cookie + crumb authentication on every request.
