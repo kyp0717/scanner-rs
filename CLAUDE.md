@@ -220,9 +220,31 @@ Snapshots are NOT used during poll cycles (too many symbols would block the poll
 thread). Poll alert rows get prices updated when enrichment or future snapshot
 batching is added.
 
-### Yahoo Finance Auth
-Yahoo Finance API requires cookie + crumb authentication:
-1. GET `https://fc.yahoo.com` → extract `set-cookie` header
-2. GET `https://query2.finance.yahoo.com/v1/test/getcrumb` with cookie → get crumb
-3. Pass both cookie header + `&crumb=` query param on all API requests
-Auth is cached per session in the enrichment worker thread.
+## Yahoo Finance API (IMPORTANT)
+Yahoo Finance API **requires** cookie + crumb authentication on every request.
+Without auth, requests return HTTP 200 with empty/null data — no error is raised.
+This is a silent failure that is easy to miss. **Never call Yahoo Finance endpoints
+without the cookie + crumb flow.**
+
+### Auth Flow (implemented in `src/enrichment.rs`)
+1. `GET https://fc.yahoo.com` → extract `set-cookie` response header
+2. `GET https://query2.finance.yahoo.com/v1/test/getcrumb` with cookie → returns crumb string
+3. All subsequent API calls must include:
+   - `Cookie` request header (from step 1)
+   - `&crumb=<url-encoded crumb>` query parameter (from step 2)
+4. Use `query2.finance.yahoo.com` (not `query1`) for all endpoints
+
+### Endpoints Used
+- **Quote Summary**: `https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=summaryProfile,defaultKeyStatistics,financialData,price&crumb=...`
+- **News Search**: `https://query2.finance.yahoo.com/v8/finance/search?q={symbol}&newsCount=5&quotesCount=0&crumb=...`
+
+### Auth Caching
+- The enrichment worker thread (`engine::spawn_enrichment_worker`) fetches auth once and reuses it for all symbols in the session
+- `enrich_results()` (used by one-shot `scan` command) fetches auth once per batch
+- `fetch_enrichment()` fetches auth per call (fallback, less efficient)
+
+### Quick Verification
+```bash
+cargo run -- enrich AAPL    # Should show Name, Sector, Float, Short%, etc.
+```
+If enrichment returns all "-" or "none", auth is broken.
