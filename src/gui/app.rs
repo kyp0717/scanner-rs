@@ -121,12 +121,32 @@ impl App {
             app.engine.db.clone(),
         );
 
+        // Spawn market data streaming worker
+        let (mktdata_tx, mktdata_rx) = std::sync::mpsc::channel::<crate::engine::MktDataRequest>();
+        let mktdata_host = app.engine.settings.host.clone();
+        let mktdata_ports: Vec<u16> = app.engine.settings.port
+            .map(|p| vec![p])
+            .unwrap_or_else(|| crate::models::DEFAULT_PORTS.to_vec());
+        let _mktdata_worker = crate::engine::spawn_market_data_worker(
+            app.engine.bg_tx.clone(),
+            mktdata_rx,
+            mktdata_host,
+            mktdata_ports,
+        );
+        app.engine.mktdata_tx = Some(mktdata_tx);
+
         // Probe TWS port
         app.engine.probe_port();
         app.update_title();
 
         // Initialize alerts from today's tws_scans
         app.engine.init_from_tws_scans(&app.rt_handle);
+
+        // Subscribe existing alert rows to streaming market data
+        let existing_symbols: Vec<String> = app.engine.alert_rows.iter().map(|r| r.symbol.clone()).collect();
+        for sym in &existing_symbols {
+            app.engine.subscribe_market_data(sym, "USD");
+        }
 
         // Auto-start polling
         let _ = app.engine.poll_on();
@@ -317,7 +337,7 @@ impl App {
                     return;
                 }
                 let _ = self.engine.poll_on();
-                self.push_output("Polling started -- scanning every 60s");
+                self.push_output("Polling started -- scanning every 15s");
                 self.alert_line = "Polling active".to_string();
             }
             "off" => {
@@ -716,7 +736,7 @@ impl App {
                 // Check poll timer
                 if self.engine.polling
                     && !self.engine.bg_busy
-                    && self.last_poll.elapsed() >= Duration::from_secs(60)
+                    && self.last_poll.elapsed() >= Duration::from_secs(15)
                 {
                     self.last_poll = std::time::Instant::now();
                     self.engine.run_poll_scanners();

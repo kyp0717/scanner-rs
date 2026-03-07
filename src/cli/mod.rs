@@ -225,6 +225,20 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
         engine.db.clone(),
     );
 
+    // Spawn market data streaming worker
+    let (mktdata_tx, mktdata_rx) = mpsc::channel::<crate::engine::MktDataRequest>();
+    let mktdata_host = engine.settings.host.clone();
+    let mktdata_ports: Vec<u16> = engine.settings.port
+        .map(|p| vec![p])
+        .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
+    let _mktdata_worker = crate::engine::spawn_market_data_worker(
+        engine.bg_tx.clone(),
+        mktdata_rx,
+        mktdata_host,
+        mktdata_ports,
+    );
+    engine.mktdata_tx = Some(mktdata_tx);
+
     let ports_desc = engine.settings.port
         .map(|p| format!("{p}"))
         .unwrap_or_else(|| format!("{:?}", DEFAULT_PORTS));
@@ -243,9 +257,15 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
     let (loaded, needs_enrich) = engine.init_from_tws_scans(&handle);
     log_alert(json, &format!("Loaded {loaded} stocks from tws_scans, {needs_enrich} queued for enrichment"));
 
+    // Subscribe existing alert rows to streaming market data
+    let existing_syms: Vec<String> = engine.alert_rows.iter().map(|r| r.symbol.clone()).collect();
+    for sym in &existing_syms {
+        engine.subscribe_market_data(sym, "USD");
+    }
+
     // Start polling
     engine.poll_on();
-    log_alert(json, "Starting poll (8 scanners, 60s cycle). Ctrl+C to stop.");
+    log_alert(json, "Starting poll (8 scanners, 15s cycle). Ctrl+C to stop.");
 
     // Setup Ctrl+C handler
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -397,7 +417,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
         // Check poll timer
         if engine.polling
             && !engine.bg_busy
-            && poll_timer.elapsed() >= Duration::from_secs(60)
+            && poll_timer.elapsed() >= Duration::from_secs(15)
         {
             poll_timer = std::time::Instant::now();
             log_alert(json, "Starting poll cycle...");

@@ -31,6 +31,15 @@ pub enum BgMessage {
         symbol: String,
         data: EnrichmentData,
     },
+    /// Real-time market data tick from the streaming thread.
+    MarketDataTick {
+        symbol: String,
+        last: Option<f64>,
+        close: Option<f64>,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        volume: Option<i64>,
+    },
 }
 
 /// Request to enrich a symbol, ordered by scanner_hits (higher = higher priority).
@@ -76,11 +85,19 @@ pub enum EngineEvent {
     },
 }
 
+/// Request to subscribe to streaming market data for a symbol.
+#[derive(Debug, Clone)]
+pub struct MktDataRequest {
+    pub symbol: String,
+    pub currency: String,
+}
+
 /// Core alert engine — business logic shared by GUI and CLI.
 pub struct AlertEngine {
     pub settings: Settings,
     pub alert_rows: Vec<AlertRow>,
     pub alert_seen: HashSet<String>,
+    pub streaming_set: HashSet<String>,
     pub polling: bool,
     pub connected_port: Option<u16>,
     pub db: Option<SupabaseClient>,
@@ -88,6 +105,7 @@ pub struct AlertEngine {
     pub bg_rx: mpsc::Receiver<BgMessage>,
     pub bg_busy: bool,
     pub enrich_tx: mpsc::Sender<EnrichRequest>,
+    pub mktdata_tx: Option<mpsc::Sender<MktDataRequest>>,
 }
 
 impl AlertEngine {
@@ -101,6 +119,7 @@ impl AlertEngine {
             settings,
             alert_rows: Vec::new(),
             alert_seen: HashSet::new(),
+            streaming_set: HashSet::new(),
             polling: false,
             connected_port: None,
             db,
@@ -108,6 +127,21 @@ impl AlertEngine {
             bg_rx,
             bg_busy: false,
             enrich_tx,
+            mktdata_tx: None,
+        }
+    }
+
+    /// Subscribe a symbol to streaming market data (if not already subscribed).
+    pub fn subscribe_market_data(&mut self, symbol: &str, currency: &str) {
+        if self.streaming_set.contains(symbol) {
+            return;
+        }
+        if let Some(ref tx) = self.mktdata_tx {
+            let _ = tx.send(MktDataRequest {
+                symbol: symbol.to_string(),
+                currency: currency.to_string(),
+            });
+            self.streaming_set.insert(symbol.to_string());
         }
     }
 
@@ -196,10 +230,18 @@ impl AlertEngine {
         let count = self.alert_seen.len();
         self.alert_seen.clear();
         self.alert_rows.clear();
+        self.streaming_set.clear();
         let _ = self.enrich_tx.send(EnrichRequest {
             symbol: String::new(),
             scanner_hits: 0,
         });
+        // Send sentinel to market data worker to cancel all subscriptions
+        if let Some(ref tx) = self.mktdata_tx {
+            let _ = tx.send(MktDataRequest {
+                symbol: String::new(),
+                currency: String::new(),
+            });
+        }
         count
     }
 
@@ -221,32 +263,12 @@ impl AlertEngine {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let start = std::time::Instant::now();
-            let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
-            let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
-            let mut connected_port = None;
-            let mut scanners_run = 0usize;
 
-            for (i, &(code, cid)) in ALERT_SCANNERS.iter().enumerate() {
-                let (results, port) = rt.block_on(
-                    tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0)),
-                );
-                if connected_port.is_none() {
-                    connected_port = port;
-                }
-                let count = results.len();
-                scanners_run += 1;
+            let (symbol_scanners, symbol_data, connected_port) = rt.block_on(
+                tws::run_poll_scan(ALERT_SCANNERS, &host, &ports, 10, 50, Some(1.0), Some(20.0)),
+            );
 
-                for r in results {
-                    let sym = r.symbol.clone();
-                    symbol_scanners
-                        .entry(sym.clone())
-                        .or_default()
-                        .push(code.to_string());
-                    symbol_data.entry(sym).or_insert(r);
-                }
-                info!(scanner = i + 1, total = ALERT_SCANNERS.len(), code, count, "scanner results");
-            }
-
+            let scanners_run = ALERT_SCANNERS.len();
             let elapsed_secs = start.elapsed().as_secs_f64();
             info!(unique_stocks = symbol_data.len(), scanners_run, elapsed_secs, "poll scan complete");
 
@@ -301,8 +323,8 @@ impl AlertEngine {
                         events.push(EngineEvent::PortDiscovered { port: p });
                     }
 
-                    // Write to Supabase
-                    if let Some(ref mut db) = self.db {
+                    // Write to Supabase (background, non-blocking)
+                    if let Some(ref self_db) = self.db {
                         let batch: HashMap<String, (serde_json::Value, Vec<String>)> = symbol_data
                             .iter()
                             .map(|(sym, r)| {
@@ -324,10 +346,12 @@ impl AlertEngine {
                                 )
                             })
                             .collect();
-                        match rt.block_on(db.record_stocks_batch(&batch)) {
-                            Ok(_) => {}
-                            Err(e) => warn!("Supabase write error: {e}"),
-                        }
+                        let mut db = self_db.clone();
+                        rt.spawn(async move {
+                            if let Err(e) = db.record_stocks_batch(&batch).await {
+                                warn!("Supabase write error: {e}");
+                            }
+                        });
                     }
 
                     // Detect new symbols
@@ -368,6 +392,8 @@ impl AlertEngine {
                                 enriched: false,
                                 avg_volume: None,
                             });
+                            // Subscribe to streaming market data for live price updates
+                            self.subscribe_market_data(sym, &r.currency);
                             self.queue_enrich(sym, hits);
                         }
                     }
@@ -416,8 +442,8 @@ impl AlertEngine {
                     });
                 }
                 BgMessage::EnrichComplete { symbol, data } => {
-                    // Write enrichment to Supabase
-                    if let Some(ref mut db) = self.db {
+                    // Write enrichment to Supabase (background, non-blocking)
+                    if let Some(ref self_db) = self.db {
                         let headlines_json = serde_json::to_string(&data.news_headlines)
                             .unwrap_or_else(|_| "[]".to_string());
                         let supa_data = serde_json::json!({
@@ -436,10 +462,12 @@ impl AlertEngine {
                             [(symbol.clone(), (supa_data, vec![]))]
                                 .into_iter()
                                 .collect();
-                        match rt.block_on(db.record_stocks_batch(&batch)) {
-                            Ok(_) => {}
-                            Err(e) => warn!("Supabase enrich write error: {e}"),
-                        }
+                        let mut db = self_db.clone();
+                        rt.spawn(async move {
+                            if let Err(e) = db.record_stocks_batch(&batch).await {
+                                warn!("Supabase enrich write error: {e}");
+                            }
+                        });
                     }
 
                     let cat = data.catalyst.as_deref().unwrap_or("-");
@@ -470,6 +498,41 @@ impl AlertEngine {
                     }
 
                     events.push(EngineEvent::EnrichComplete { symbol });
+                }
+                BgMessage::MarketDataTick {
+                    symbol,
+                    last,
+                    close,
+                    bid: _,
+                    ask: _,
+                    volume,
+                } => {
+                    if let Some(row) =
+                        self.alert_rows.iter_mut().find(|r| r.symbol == symbol)
+                    {
+                        if let Some(l) = last {
+                            row.last = Some(l);
+                        }
+                        if let Some(v) = volume {
+                            row.volume = Some(v);
+                            // Recompute rvol if avg_volume is known
+                            if let Some(avg) = row.avg_volume {
+                                if avg > 0 {
+                                    row.rvol = Some(v as f64 / avg as f64);
+                                }
+                            }
+                        }
+                        // Compute change_pct from last and close
+                        let effective_close = close.or_else(|| {
+                            // Use stored change_pct to back-derive close if we don't have it
+                            None
+                        });
+                        if let (Some(l), Some(c)) = (row.last, effective_close) {
+                            if c > 0.0 {
+                                row.change_pct = Some((l - c) / c * 100.0);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -653,6 +716,159 @@ pub fn spawn_enrichment_worker(
                 }
             }
         }
+    })
+}
+
+/// Spawn the market data streaming worker thread.
+///
+/// Holds a persistent TWS connection and subscribes to real-time market data
+/// for symbols sent via `mktdata_rx`. Each subscription gets its own tokio task
+/// that forwards price/volume ticks to the engine via `bg_tx`.
+pub fn spawn_market_data_worker(
+    bg_tx: mpsc::Sender<BgMessage>,
+    mktdata_rx: mpsc::Receiver<MktDataRequest>,
+    host: String,
+    ports: Vec<u16>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        use ibapi::market_data::realtime::TickTypes;
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // Connect to TWS (client_id 30 for streaming)
+            let ports_ref = if ports.is_empty() { DEFAULT_PORTS } else { &ports };
+            let mut client_opt = None;
+            for &port in ports_ref {
+                let addr = format!("{host}:{port}");
+                match ibapi::Client::connect(&addr, 30).await {
+                    Ok(c) => {
+                        info!(port, "market data stream connected");
+                        client_opt = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(port, "market data stream connect failed: {e}");
+                    }
+                }
+            }
+            let client = match client_opt {
+                Some(c) => Arc::new(c),
+                None => {
+                    warn!("market data worker: could not connect to TWS");
+                    return;
+                }
+            };
+
+            let mut subscribed: HashSet<String> = HashSet::new();
+
+            loop {
+                // Drain new subscription requests
+                loop {
+                    match mktdata_rx.try_recv() {
+                        Ok(req) => {
+                            if req.symbol.is_empty() {
+                                // Sentinel: clear tracked set (tasks will end naturally
+                                // when their subscriptions are cancelled by TWS)
+                                subscribed.clear();
+                                continue;
+                            }
+                            if subscribed.contains(&req.symbol) {
+                                continue;
+                            }
+                            subscribed.insert(req.symbol.clone());
+
+                            // Spawn an async task per symbol to stream ticks
+                            let client = Arc::clone(&client);
+                            let tx = bg_tx.clone();
+                            let symbol = req.symbol.clone();
+                            let currency = req.currency.clone();
+                            tokio::spawn(async move {
+                                let contract = ibapi::contracts::Contract::stock(&symbol);
+                                let cur = if currency.is_empty() { "USD" } else { &currency };
+                                let contract = ibapi::contracts::Contract {
+                                    currency: ibapi::contracts::Currency::from(cur),
+                                    ..contract.build()
+                                };
+
+                                let mut subscription = match client
+                                    .market_data(&contract)
+                                    .subscribe()
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        warn!(symbol = %symbol, "market data subscribe failed: {e}");
+                                        return;
+                                    }
+                                };
+
+                                info!(symbol = %symbol, "streaming market data subscribed");
+                                let mut stored_close: Option<f64> = None;
+
+                                while let Some(result) = subscription.next().await {
+                                    let tick = match result {
+                                        Ok(t) => t,
+                                        Err(_) => break,
+                                    };
+
+                                    let mut last = None;
+                                    let mut close = None;
+                                    let mut bid = None;
+                                    let mut ask = None;
+                                    let mut volume = None;
+
+                                    match tick {
+                                        TickTypes::Price(tp) => match tp.tick_type {
+                                            ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
+                                            ibapi::contracts::tick_types::TickType::Close => {
+                                                close = Some(tp.price);
+                                                stored_close = close;
+                                            }
+                                            ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
+                                            ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
+                                            _ => continue,
+                                        },
+                                        TickTypes::PriceSize(tp) => match tp.price_tick_type {
+                                            ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
+                                            ibapi::contracts::tick_types::TickType::Close => {
+                                                close = Some(tp.price);
+                                                stored_close = close;
+                                            }
+                                            ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
+                                            ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
+                                            _ => continue,
+                                        },
+                                        TickTypes::Size(ts) => {
+                                            if ts.tick_type == ibapi::contracts::tick_types::TickType::Volume {
+                                                volume = Some(ts.size as i64);
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        _ => continue,
+                                    }
+
+                                    let _ = tx.send(BgMessage::MarketDataTick {
+                                        symbol: symbol.clone(),
+                                        last,
+                                        close: close.or(stored_close),
+                                        bid,
+                                        ask,
+                                        volume,
+                                    });
+                                }
+                            });
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                // Sleep briefly before checking for new requests
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
     })
 }
 

@@ -193,12 +193,80 @@ pub async fn run_poll_scan(
         }
     }
 
+    // No snapshots here — streaming market data thread handles live prices
+
     (symbol_scanners, symbol_data, Some(port))
+}
+
+/// Snapshot result for a single symbol.
+struct SnapshotResult {
+    symbol: String,
+    last: Option<f64>,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    close: Option<f64>,
+    volume: Option<i64>,
+}
+
+/// Fetch a single symbol's snapshot from an existing client connection.
+async fn fetch_one_snapshot(client: &ibapi::Client, symbol: &str, currency: &str) -> Option<SnapshotResult> {
+    let contract = ibapi::contracts::Contract {
+        symbol: ibapi::contracts::Symbol::from(symbol),
+        security_type: ibapi::contracts::SecurityType::Stock,
+        exchange: ibapi::contracts::Exchange::from("SMART"),
+        currency: ibapi::contracts::Currency::from(if currency.is_empty() { "USD" } else { currency }),
+        ..Default::default()
+    };
+
+    let mut subscription = ibapi::market_data::realtime::market_data(
+        client, &contract, &[], true, false,
+    )
+    .await
+    .ok()?;
+
+    let mut last = None;
+    let mut close = None;
+    let mut volume = None;
+    let mut bid = None;
+    let mut ask = None;
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, subscription.next()).await {
+            Ok(Some(Ok(tick))) => match tick {
+                TickTypes::SnapshotEnd => break,
+                TickTypes::Price(tp) => match tp.tick_type {
+                    TickType::Last => last = Some(tp.price),
+                    TickType::Close => close = Some(tp.price),
+                    TickType::Bid => bid = Some(tp.price),
+                    TickType::Ask => ask = Some(tp.price),
+                    _ => {}
+                },
+                TickTypes::PriceSize(tp) => match tp.price_tick_type {
+                    TickType::Last => last = Some(tp.price),
+                    TickType::Close => close = Some(tp.price),
+                    TickType::Bid => bid = Some(tp.price),
+                    TickType::Ask => ask = Some(tp.price),
+                    _ => {}
+                },
+                TickTypes::Size(ts) => {
+                    if ts.tick_type == TickType::Volume {
+                        volume = Some(ts.size as i64);
+                    }
+                }
+                _ => {}
+            },
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    Some(SnapshotResult { symbol: symbol.to_string(), last, bid, ask, close, volume })
 }
 
 /// Fetch market data snapshots for a batch of scan results.
 /// Populates last, bid, ask, volume, close, and computes change_pct.
-/// Limited to `max_symbols` to avoid blocking too long; each symbol has a 3s timeout.
+/// Limited to `max_symbols`; requests run concurrently in chunks of 10.
 pub async fn fetch_snapshots(
     results: &mut HashMap<String, ScanResult>,
     host: &str,
@@ -218,107 +286,47 @@ pub async fn fetch_snapshots(
         }
     };
 
-    let symbols: Vec<String> = results.keys().take(max_symbols).cloned().collect();
+    // Collect symbols + currencies upfront
+    let sym_list: Vec<(String, String)> = results
+        .iter()
+        .take(max_symbols)
+        .map(|(sym, r)| (sym.clone(), r.currency.clone()))
+        .collect();
+
     let mut fetched = 0usize;
+    let total = sym_list.len();
 
-    for sym in &symbols {
-        let r = match results.get(sym) {
-            Some(r) => r,
-            None => continue,
-        };
+    // Process in concurrent chunks of 10
+    for chunk in sym_list.chunks(10) {
+        let futs: Vec<_> = chunk
+            .iter()
+            .map(|(sym, cur)| fetch_one_snapshot(&client, sym, cur))
+            .collect();
+        let snap_results = futures::future::join_all(futs).await;
 
-        let contract = ibapi::contracts::Contract {
-            symbol: ibapi::contracts::Symbol::from(sym.as_str()),
-            security_type: ibapi::contracts::SecurityType::Stock,
-            exchange: ibapi::contracts::Exchange::from("SMART"),
-            currency: ibapi::contracts::Currency::from(
-                if r.currency.is_empty() { "USD" } else { &r.currency },
-            ),
-            ..Default::default()
-        };
-
-        // Request snapshot (snapshot=true means one-shot, no streaming)
-        let mut subscription = match ibapi::market_data::realtime::market_data(
-            &client, &contract, &[], true, false,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(symbol = %sym, "snapshot request failed: {e}");
-                continue;
-            }
-        };
-
-        let mut last = None;
-        let mut close = None;
-        let mut volume = None;
-        let mut bid = None;
-        let mut ask = None;
-
-        // Drain ticks until SnapshotEnd or 3s timeout
-        let mut tick_count = 0u32;
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
-        loop {
-            match tokio::time::timeout_at(deadline, subscription.next()).await {
-                Ok(Some(Ok(tick))) => {
-                    tick_count += 1;
-                    match tick {
-                        TickTypes::SnapshotEnd => break,
-                        TickTypes::Price(tp) => match tp.tick_type {
-                            TickType::Last => last = Some(tp.price),
-                            TickType::Close => close = Some(tp.price),
-                            TickType::Bid => bid = Some(tp.price),
-                            TickType::Ask => ask = Some(tp.price),
-                            _ => {}
-                        },
-                        TickTypes::PriceSize(tp) => match tp.price_tick_type {
-                            TickType::Last => last = Some(tp.price),
-                            TickType::Close => close = Some(tp.price),
-                            TickType::Bid => bid = Some(tp.price),
-                            TickType::Ask => ask = Some(tp.price),
-                            _ => {}
-                        },
-                        TickTypes::Size(ts) => {
-                            if ts.tick_type == TickType::Volume {
-                                volume = Some(ts.size as i64);
-                            }
-                        }
-                        _ => {}
+        for snap in snap_results.into_iter().flatten() {
+            if let Some(r) = results.get_mut(&snap.symbol) {
+                if let Some(l) = snap.last {
+                    r.last = Some(l);
+                }
+                r.bid = snap.bid;
+                r.ask = snap.ask;
+                r.close = snap.close;
+                if let Some(v) = snap.volume {
+                    r.volume = Some(v);
+                }
+                if let (Some(l), Some(c)) = (r.last, r.close) {
+                    if c > 0.0 {
+                        r.change_pct = Some((l - c) / c * 100.0);
+                        r.change = Some(l - c);
                     }
                 }
-                Ok(Some(Err(_))) | Ok(None) => break,
-                Err(_) => {
-                    debug!(symbol = %sym, "snapshot timeout");
-                    break;
-                }
+                fetched += 1;
             }
-        }
-        debug!(symbol = %sym, tick_count, last = ?last, close = ?close, "snapshot ticks");
-
-        // Update the ScanResult
-        if let Some(r) = results.get_mut(sym) {
-            if let Some(l) = last {
-                r.last = Some(l);
-            }
-            r.bid = bid;
-            r.ask = ask;
-            r.close = close;
-            if let Some(v) = volume {
-                r.volume = Some(v);
-            }
-            // Compute change_pct from last and close
-            if let (Some(l), Some(c)) = (r.last, r.close) {
-                if c > 0.0 {
-                    r.change_pct = Some((l - c) / c * 100.0);
-                    r.change = Some(l - c);
-                }
-            }
-            fetched += 1;
         }
     }
 
-    info!(fetched, total = symbols.len(), "market data snapshots");
+    info!(fetched, total, "market data snapshots");
 }
 
 /// Fetch scanner parameters XML from TWS.

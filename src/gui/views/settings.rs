@@ -49,7 +49,7 @@ impl App {
         ]);
         lines = lines.push(row![
             label!("Polling"),
-            val!(format!("{} (60s cycle)", poll_str))
+            val!(format!("{} (15s cycle)", poll_str))
         ]);
         lines = lines.push(row![
             label!("Seen"),
