@@ -7,5 +7,5 @@ pub mod error;
 pub mod history;
 pub mod models;
 pub mod scanner;
-pub mod tui;
+pub mod gui;
 pub mod tws;

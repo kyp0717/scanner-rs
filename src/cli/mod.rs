@@ -68,7 +68,7 @@ pub async fn cmd_list(group: Option<&str>, host: &str, port: Option<u16>) -> Res
     Ok(())
 }
 
-/// Query and print Supabase sightings history.
+/// Query and print Supabase tws_scans history.
 pub async fn cmd_history(what: Option<&str>) -> Result<()> {
     let config = SupabaseConfig::from_env()?;
     let db = SupabaseClient::new(config);
@@ -238,10 +238,10 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
         log_alert(json, "TWS unavailable, alerts will be empty");
     }
 
-    // Initialize from sightings
-    log_alert(json, "Loading today's sightings from Supabase...");
-    let (loaded, needs_enrich) = engine.init_from_sightings(&handle);
-    log_alert(json, &format!("Loaded {loaded} stocks from history, {needs_enrich} queued for enrichment"));
+    // Initialize from tws_scans
+    log_alert(json, "Loading today's tws_scans from Supabase...");
+    let (loaded, needs_enrich) = engine.init_from_tws_scans(&handle);
+    log_alert(json, &format!("Loaded {loaded} stocks from tws_scans, {needs_enrich} queued for enrichment"));
 
     // Start polling
     engine.poll_on();

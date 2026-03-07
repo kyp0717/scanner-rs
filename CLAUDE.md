@@ -25,13 +25,14 @@ Private repo — `.env` and `.mcp.json` are tracked in git intentionally.
 ```bash
 cargo build                    # debug build
 cargo build --release          # release build
-cargo run                      # launch TUI app
+cargo run                      # launch GUI app
 cargo run -- --help            # show CLI help
 cargo test                     # run all tests
 ```
 
 ## CLI Testing Commands
-The CLI has subcommands to test individual components without the full TUI:
+The CLI has subcommands to test individual components without the full GUI.
+**The CLI (`src/cli/`) is essential for testing and must never be removed.**
 
 ```bash
 # Test scanner connection and scanning
@@ -55,8 +56,8 @@ cargo run -- alert
 cargo run -- alert --port 7497
 cargo run -- alert --json          # JSON lines on stdout, logs on stderr
 
-# Launch full TUI
-cargo run -- tui
+# Launch full GUI
+cargo run -- gui
 ```
 
 ## Project Structure (Modular)
@@ -67,29 +68,60 @@ src/
   config.rs        — settings, .env loading, constants
   models.rs        — shared data types (ScanResult, AlertRow, Settings, etc.)
   tws/
-    mod.rs         — TWS client, connection, scanner subscriptions
-    messages.rs    — IB API message encoding/decoding
+    mod.rs         — TWS scanner via ibapi crate + XML parsing
   engine/
-    mod.rs         — core alert engine (shared by TUI and CLI)
+    mod.rs         — core alert engine (shared by GUI and CLI)
   cli/
     mod.rs         — CLI subcommand handlers (scan, alert, history, enrich)
   scanner.rs       — scanner logic, enrichment, filtering, table display
-  history.rs       — Supabase persistence (sightings CRUD)
+  history.rs       — Supabase persistence (tws_scans CRUD)
   enrichment.rs    — Yahoo Finance data fetching
   catalyst.rs      — news catalyst classification
-  tui/
-    mod.rs         — Textual-style TUI with ratatui
-    app.rs         — app state and event loop
-    ui.rs          — rendering / layout
+  gui/
+    mod.rs         — iced GUI module
+    app.rs         — app state, Message enum, iced integration, tests
+    theme.rs       — dark theme colors and widget styles
+    components/
+      mod.rs       — shared components
+      side_rail.rs — 48px icon rail with SVG icons + tooltips
+    views/
+      mod.rs       — view module
+      monitor.rs   — alert table + detail panel (default view)
+      scanner.rs   — command input + scan output
+      log.rs       — combined log view (engine events + tws_scans, tagged by source)
+      settings.rs  — settings + connection status
   error.rs         — error types
 ```
 
+## Architecture: CLI ↔ Engine ↔ GUI
+
+```
+main.rs (clap router)
+  ├── scan/list/enrich/history  →  direct tws/enrichment calls (no engine)
+  ├── alert                     →  AlertEngine + stdout loop
+  └── gui (default)             →  AlertEngine + iced event loop
+```
+
+**AlertEngine** (`engine/mod.rs`) is the shared core. It owns scanning, polling,
+enrichment queueing, alert tracking, and Supabase persistence. Both CLI alert
+mode and GUI create an engine and consume the same `EngineEvent` variants:
+- `ScanComplete` — one-shot scan finished
+- `PollCycleComplete` — all 8 scanners polled, new symbols detected
+- `EnrichComplete` — Yahoo Finance data arrived for a symbol
+- `PortDiscovered` — TWS port auto-detected
+
+Background work (TWS scanning, Yahoo enrichment) runs in OS threads via `mpsc`
+channels. Each thread creates its own `tokio::runtime::Runtime` for async ibapi
+calls. The main thread (CLI loop or GUI event loop) calls `engine.tick()` each
+iteration to drain events without blocking.
+
 ## Dependencies
+- `ibapi` — IB TWS API client (scanner subscriptions, connection handling)
 - `tokio` — async runtime
 - `reqwest` — HTTP client (Yahoo Finance, Supabase REST)
 - `serde` / `serde_json` — serialization
 - `clap` — CLI argument parsing
-- `ratatui` + `crossterm` — TUI framework
+- `iced` — GUI framework (with svg feature)
 - `dotenv` — .env loading
 - `chrono` — timestamps
 - `tracing` — structured logging
@@ -108,7 +140,7 @@ src/
 | 7 | `TOP_VOLUME_RATE` | 16 | Volume acceleration |
 | 8 | `HIGH_VS_52W_HL` | 17 | New 52-week highs |
 
-## TUI Commands
+## GUI Scanner Commands
 ```
 scan <alias|code> [--rows N] [--min-price N] [--max-price N]
 list                    3-level picker: instrument -> category -> scanner
@@ -135,15 +167,16 @@ quit / exit / q         Exit
 - `gapdown` -> `LOW_OPEN_GAP`
 
 ## Supabase Persistence
-Table `sightings` in hosted Postgres. Credentials in `.env`.
+Table `tws_scans` in hosted Postgres. Credentials in `.env`.
 Columns: symbol (unique), first/last seen timestamps, scanners (comma-sep),
-hit_count, last_price, change_pct, rvol, float_shares, catalyst, name, sector.
+hit_count, last_price, change_pct, rvol, float_shares, catalyst, catalyst_time,
+name, sector, industry, short_pct, avg_volume, news_headlines, enriched_at.
 
 ## Design Rules
 - **Modular code** — each module handles one concern, testable in isolation
 - **CLI for testing** — every module can be tested via CLI subcommands
-- **Black background** — terminal aesthetic
-- **Keep it simple** — ratatui for layout only, no over-engineering
+- **Dark theme** — dark background GUI aesthetic
+- **Keep it simple** — iced for layout, no over-engineering
 - **Tests first** — unit tests for all pure logic (filtering, classification, enrichment)
 
 ## Logging
@@ -153,10 +186,17 @@ hit_count, last_price, change_pct, rvol, float_shares, catalyst, name, sector.
   - JSON mode (`--json` on): logs go to stderr, stdout is clean JSON lines
 - Engine-level logging uses `tracing::{info, warn}` — not `eprintln!`
 
-## TWS API Protocol
-Interactive Brokers TWS uses a binary protocol over TCP.
+## TWS Connection
+Uses `ibapi` crate for all TWS communication (connection, scanner subscriptions,
+scanner parameters). No hand-rolled protocol code.
 - Ports: 7500 (paper), 7497 (live) — auto-detect with fallback
 - Client IDs: 1 (interactive), 3 (params), 10-17 (alert scanners)
-- Handshake: send `API\0` + length-prefixed version range `v100..176`
-- Server response is 4-byte BE length prefix + null-separated fields (v100+ format)
-- Market data type 4 = delayed frozen
+- All tws functions are async; engine threads create local tokio runtimes
+
+### Scanner Data + Market Snapshots
+The IB TWS scanner API (`ibapi::scanner::ScannerData`) only returns **contract
+data** (rank, contract_details, leg) — not market data. After each scan,
+`tws::fetch_snapshots()` makes snapshot `market_data` requests (one per symbol)
+to fetch last price, bid, ask, volume, and previous close. Change% is computed
+from last vs close. This runs in the same background thread as scanning, adding
+a few seconds to each poll cycle. Client ID 20 is used for snapshot connections.

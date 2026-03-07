@@ -55,9 +55,9 @@ pub struct AlertRow {
     pub avg_volume: Option<i64>,
 }
 
-/// A sighting row from Supabase.
+/// A TWS scan row from Supabase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sighting {
+pub struct TwsScan {
     pub id: Option<i64>,
     pub symbol: String,
     pub first_seen: String,
@@ -170,8 +170,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sighting_new_fields() {
-        let s = Sighting {
+    fn test_tws_scan_new_fields() {
+        let s = TwsScan {
             id: None,
             symbol: "TEST".to_string(),
             first_seen: "2024-01-01T00:00:00+00:00".to_string(),

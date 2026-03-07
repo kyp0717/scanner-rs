@@ -1,13 +1,8 @@
 use std::time::Duration;
 
-use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::execute;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use iced::keyboard;
+use iced::widget::{container, row};
+use iced::{Element, Font, Length, Subscription, Task, Theme};
 use tracing::info;
 
 use crate::config::SupabaseConfig;
@@ -15,9 +10,21 @@ use crate::engine::{AlertEngine, EngineEvent};
 use crate::history::SupabaseClient;
 use crate::models::*;
 use crate::tws;
-use super::ui;
 
-/// Application mode.
+use super::components::side_rail::side_rail_view;
+use super::theme;
+
+/// Application view (side rail navigation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Monitor,
+    Scanner,
+    Log,
+    Settings,
+}
+
+/// Application mode (kept for test compatibility).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Alert,
@@ -25,10 +32,23 @@ pub enum Mode {
     Log,
 }
 
-/// Application state for the TUI — thin wrapper around AlertEngine.
+/// Messages for the iced application.
+#[derive(Debug, Clone)]
+pub enum Message {
+    Tick,
+    NavigateTo(View),
+    InputChanged(String),
+    SubmitCommand,
+    SelectAlert(usize),
+    IncreaseFontSize,
+    DecreaseFontSize,
+    FontLoaded(Result<(), iced::font::Error>),
+}
+
+/// Application state for the GUI.
 pub struct App {
     pub engine: AlertEngine,
-    // TUI-only state
+    pub view: View,
     pub mode: Mode,
     pub output_lines: Vec<String>,
     pub alert_line: String,
@@ -42,12 +62,19 @@ pub struct App {
     pub scroll_offset: u16,
     pub log_lines: Vec<String>,
     pub log_scroll: u16,
+    pub font_size: u16,
+    pub rt_handle: tokio::runtime::Handle,
+    _runtime: tokio::runtime::Runtime,
+    pub last_poll: std::time::Instant,
 }
 
 impl App {
     pub fn new(engine: AlertEngine) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = rt.handle().clone();
         Self {
             engine,
+            view: View::Monitor,
             mode: Mode::Alert,
             output_lines: Vec::new(),
             alert_line: "No alerts".to_string(),
@@ -61,7 +88,51 @@ impl App {
             scroll_offset: 0,
             log_lines: Vec::new(),
             log_scroll: 0,
+            font_size: 12,
+            rt_handle: handle,
+            _runtime: rt,
+            last_poll: std::time::Instant::now(),
         }
+    }
+
+    /// Entry point for iced. Creates the app with engine setup.
+    pub fn new_gui(host: String, port: Option<u16>) -> (Self, Task<Message>) {
+        crate::config::load_env();
+
+        let (enrich_tx, enrich_rx) = std::sync::mpsc::channel::<crate::engine::EnrichRequest>();
+
+        let db = if let Ok(config) = SupabaseConfig::from_env() {
+            info!("Connected to Supabase");
+            Some(SupabaseClient::new(config))
+        } else {
+            None
+        };
+
+        let mut settings = Settings::default();
+        settings.host = host;
+        settings.port = port;
+        let mut app = App::new(AlertEngine::new(enrich_tx, settings, db));
+
+        // Spawn enrichment worker
+        let _worker = crate::engine::spawn_enrichment_worker(
+            app.engine.bg_tx.clone(),
+            enrich_rx,
+            app.rt_handle.clone(),
+            app.engine.db.clone(),
+        );
+
+        // Probe TWS port
+        app.engine.probe_port();
+        app.update_title();
+
+        // Initialize alerts from today's tws_scans
+        app.engine.init_from_tws_scans(&app.rt_handle);
+
+        // Auto-start polling
+        let _ = app.engine.poll_on();
+        app.update_title();
+
+        (app, Task::none())
     }
 
     fn update_title(&mut self) {
@@ -91,9 +162,9 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    fn push_log(&mut self, line: &str) {
+    fn push_log(&mut self, source: &str, line: &str) {
         let now = chrono::Local::now().format("%H:%M:%S");
-        self.log_lines.push(format!("[{now}] {line}"));
+        self.log_lines.push(format!("[{now}] [{source}] {line}"));
         if self.log_lines.len() > 500 {
             self.log_lines.remove(0);
         }
@@ -208,7 +279,8 @@ impl App {
         self.push_output(&format!("Scanning {scanner_code} (rows={rows})..."));
         self.alert_line = format!("Scanning {scanner_code}...");
 
-        self.engine.start_scan(&scanner_code, rows, min_price, max_price);
+        self.engine
+            .start_scan(&scanner_code, rows, min_price, max_price);
     }
 
     fn cmd_list(&mut self, args: &[&str]) {
@@ -255,9 +327,7 @@ impl App {
             }
             "clear" => {
                 let count = self.engine.poll_clear();
-                self.push_output(&format!(
-                    "Cleared {count} seen symbols and alert table"
-                ));
+                self.push_output(&format!("Cleared {count} seen symbols and alert table"));
             }
             _ => {
                 self.push_output("Usage: poll [on|off|clear]");
@@ -445,14 +515,18 @@ impl App {
         }
     }
 
-    /// Translate engine events into TUI state updates.
+    /// Translate engine events into app state updates.
     fn handle_engine_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::ScanComplete {
                 scanner_code,
                 results,
             } => {
-                self.push_log(&format!("Scan: {} -- {} results", scanner_code, results.len()));
+                self.push_log("scan", &format!(
+                    "{} -- {} results",
+                    scanner_code,
+                    results.len()
+                ));
                 self.clear_output();
                 if results.is_empty() {
                     self.push_output("No results.");
@@ -561,9 +635,12 @@ impl App {
                 scanners_run,
                 elapsed_secs,
             } => {
-                self.push_log(&format!(
-                    "Poll: {} stocks, {} new, {} scanners ({:.1}s)",
-                    total_stocks, new_symbols.len(), scanners_run, elapsed_secs
+                self.push_log("poll", &format!(
+                    "{} stocks, {} new, {} scanners ({:.1}s)",
+                    total_stocks,
+                    new_symbols.len(),
+                    scanners_run,
+                    elapsed_secs
                 ));
                 let now = chrono::Local::now().format("%H:%M:%S");
                 if new_symbols.is_empty() {
@@ -573,7 +650,6 @@ impl App {
                         self.engine.alert_seen.len()
                     );
                 } else {
-                    // Set alert line to top alert
                     if let Some(top) = self.engine.alert_rows.first() {
                         let chg = top.change_pct.unwrap_or(0.0);
                         let rvol = top.rvol.unwrap_or(0.0);
@@ -591,209 +667,141 @@ impl App {
                 }
             }
             EngineEvent::EnrichComplete { symbol } => {
-                // Find the enriched row and log details
                 if let Some(r) = self.engine.alert_rows.iter().find(|r| r.symbol == symbol) {
                     let catalyst = r.catalyst.as_deref().unwrap_or("none");
-                    let float = r.float_shares.map(|f| {
-                        if f >= 1_000_000.0 { format!("{:.1}M", f / 1_000_000.0) }
-                        else if f >= 1_000.0 { format!("{:.0}K", f / 1_000.0) }
-                        else { format!("{f:.0}") }
-                    }).unwrap_or_else(|| "-".to_string());
-                    self.push_log(&format!("Enriched: {symbol} -- {catalyst} (float: {float})"));
+                    let float = r
+                        .float_shares
+                        .map(|f| {
+                            if f >= 1_000_000.0 {
+                                format!("{:.1}M", f / 1_000_000.0)
+                            } else if f >= 1_000.0 {
+                                format!("{:.0}K", f / 1_000.0)
+                            } else {
+                                format!("{f:.0}")
+                            }
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    self.push_log("enrich", &format!("{symbol} -- {catalyst} (float: {float})"));
                 } else {
-                    self.push_log(&format!("Enriched: {symbol}"));
+                    self.push_log("enrich", &format!("{symbol}"));
                 }
             }
             EngineEvent::PortDiscovered { port } => {
-                self.push_log(&format!("Connected: port {port}"));
+                self.push_log("tws", &format!("Connected: port {port}"));
                 self.update_title();
             }
         }
     }
 }
 
-/// Run the TUI application. Creates its own tokio runtime for async ops.
-pub fn run_tui(host: String, port: Option<u16>) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let handle = rt.handle().clone();
+// ── iced integration ──────────────────────────────────────────────────
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create enrich channel first, then engine, then spawn worker with engine's bg_tx
-    let (enrich_tx, enrich_rx) = std::sync::mpsc::channel::<crate::engine::EnrichRequest>();
-
-    // Try to connect to Supabase
-    crate::config::load_env();
-    let db = if let Ok(config) = SupabaseConfig::from_env() {
-        info!("Connected to Supabase");
-        Some(SupabaseClient::new(config))
-    } else {
-        None
-    };
-
-    let mut settings = Settings::default();
-    settings.host = host;
-    settings.port = port;
-    let mut app = App::new(AlertEngine::new(enrich_tx, settings, db));
-
-    // Spawn enrichment worker with Supabase cache support
-    let _worker = crate::engine::spawn_enrichment_worker(
-        app.engine.bg_tx.clone(),
-        enrich_rx,
-        handle.clone(),
-        app.engine.db.clone(),
-    );
-
-    // Probe TWS port
-    app.engine.probe_port();
-    app.update_title();
-
-    // Initialize alerts from today's sightings
-    app.engine.init_from_sightings(&handle);
-
-    // Auto-start polling so alerts flow immediately
-    let _ = app.engine.poll_on();
-    app.update_title();
-
-    // Main event loop
-    let mut poll_timer = std::time::Instant::now();
-
-    loop {
-        // Draw UI
-        terminal.draw(|f| ui::draw(f, &app))?;
-
-        // Handle events with timeout
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.should_quit = true;
-                    }
-                    KeyCode::Tab => {
-                        app.mode = match app.mode {
-                            Mode::Alert => Mode::Scan,
-                            Mode::Scan => Mode::Log,
-                            Mode::Log => Mode::Alert,
-                        };
-                        app.update_title();
-                    }
-                    KeyCode::Esc if app.mode != Mode::Alert => {
-                        app.mode = Mode::Alert;
-                        app.update_title();
-                    }
-                    KeyCode::Enter if app.mode == Mode::Scan => {
-                        let input = app.input.clone();
-                        app.input.clear();
-                        app.input_cursor = 0;
-                        app.handle_input(&input, &handle);
-                    }
-                    KeyCode::Char(c) if app.mode == Mode::Scan => {
-                        app.input.insert(app.input_cursor, c);
-                        app.input_cursor += 1;
-                    }
-                    KeyCode::Backspace if app.mode == Mode::Scan => {
-                        if app.input_cursor > 0 {
-                            app.input_cursor -= 1;
-                            app.input.remove(app.input_cursor);
-                        }
-                    }
-                    KeyCode::Left if app.mode == Mode::Scan => {
-                        if app.input_cursor > 0 {
-                            app.input_cursor -= 1;
-                        }
-                    }
-                    KeyCode::Right if app.mode == Mode::Scan => {
-                        if app.input_cursor < app.input.len() {
-                            app.input_cursor += 1;
-                        }
-                    }
-                    KeyCode::Up if app.mode == Mode::Scan => {
-                        if !app.command_history.is_empty() {
-                            if app.history_idx == -1 {
-                                app.history_idx = app.command_history.len() as i32 - 1;
-                            } else if app.history_idx > 0 {
-                                app.history_idx -= 1;
-                            }
-                            if app.history_idx >= 0 {
-                                app.input =
-                                    app.command_history[app.history_idx as usize].clone();
-                                app.input_cursor = app.input.len();
-                            }
-                        }
-                    }
-                    KeyCode::Down if app.mode == Mode::Scan => {
-                        if app.history_idx >= 0 {
-                            if (app.history_idx as usize) < app.command_history.len() - 1 {
-                                app.history_idx += 1;
-                                app.input =
-                                    app.command_history[app.history_idx as usize].clone();
-                            } else {
-                                app.history_idx = -1;
-                                app.input.clear();
-                            }
-                            app.input_cursor = app.input.len();
-                        }
-                    }
-                    KeyCode::Up if app.mode == Mode::Alert => {
-                        if app.selected_alert_row > 0 {
-                            app.selected_alert_row -= 1;
-                        }
-                    }
-                    KeyCode::Down if app.mode == Mode::Alert => {
-                        if app.selected_alert_row + 1 < app.engine.alert_rows.len() {
-                            app.selected_alert_row += 1;
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        if app.mode == Mode::Log {
-                            app.log_scroll = app.log_scroll.saturating_sub(10);
-                        } else {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        if app.mode == Mode::Log {
-                            app.log_scroll = app.log_scroll.saturating_add(10);
-                        } else {
-                            app.scroll_offset = app.scroll_offset.saturating_add(10);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Drain engine events
-        let events = app.engine.tick(&handle);
-        for event in events {
-            app.handle_engine_event(event);
-        }
-
-        // Check poll timer
-        if app.engine.polling
-            && !app.engine.bg_busy
-            && poll_timer.elapsed() >= Duration::from_secs(60)
-        {
-            poll_timer = std::time::Instant::now();
-            app.engine.run_poll_scanners();
-        }
-
-        if app.should_quit {
-            break;
-        }
+impl App {
+    pub fn iced_title(&self) -> String {
+        "Scanner".to_string()
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    pub fn iced_theme(&self) -> Theme {
+        theme::scanner_theme()
+    }
 
-    Ok(())
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tick => {
+                let events = self.engine.tick(&self.rt_handle);
+                for event in events {
+                    self.handle_engine_event(event);
+                }
+
+                // Check poll timer
+                if self.engine.polling
+                    && !self.engine.bg_busy
+                    && self.last_poll.elapsed() >= Duration::from_secs(60)
+                {
+                    self.last_poll = std::time::Instant::now();
+                    self.engine.run_poll_scanners();
+                }
+
+                if self.should_quit {
+                    return iced::window::get_latest()
+                        .and_then(iced::window::close);
+                }
+            }
+            Message::NavigateTo(view) => {
+                self.view = view;
+            }
+            Message::InputChanged(value) => {
+                self.input = value;
+            }
+            Message::SubmitCommand => {
+                let input = self.input.clone();
+                self.input.clear();
+                self.input_cursor = 0;
+                let handle = self.rt_handle.clone();
+                self.handle_input(&input, &handle);
+            }
+            Message::SelectAlert(i) => {
+                self.selected_alert_row = i;
+            }
+            Message::IncreaseFontSize => {
+                if self.font_size < 24 {
+                    self.font_size += 1;
+                }
+            }
+            Message::DecreaseFontSize => {
+                if self.font_size > 8 {
+                    self.font_size -= 1;
+                }
+            }
+            Message::FontLoaded(_) => {}
+        }
+        Task::none()
+    }
+
+    pub fn view(&self) -> Element<Message> {
+        let rail = side_rail_view(self.view);
+        let content = match self.view {
+            View::Monitor => self.monitor_view(),
+            View::Scanner => self.scanner_view(),
+            View::Log => self.log_view(),
+            View::Settings => self.settings_view(),
+        };
+
+        let main = container(content)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        row![rail, main].into()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        let tick = iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick);
+
+        let kbd = keyboard::on_key_press(|key, modifiers| {
+            if modifiers.control() {
+                return match key.as_ref() {
+                    keyboard::Key::Character("=") | keyboard::Key::Character("+") => {
+                        Some(Message::IncreaseFontSize)
+                    }
+                    keyboard::Key::Character("-") => Some(Message::DecreaseFontSize),
+                    _ => None,
+                };
+            }
+            None
+        });
+
+        Subscription::batch(vec![tick, kbd])
+    }
+}
+
+/// Launch the iced GUI application.
+pub fn run_gui(host: String, port: Option<u16>) -> iced::Result {
+    iced::application(App::iced_title, App::update, App::view)
+        .subscription(App::subscription)
+        .theme(App::iced_theme)
+        .default_font(Font::MONOSPACE)
+        .window_size((1400.0, 900.0))
+        .run_with(move || App::new_gui(host, port))
 }
 
 #[cfg(test)]
@@ -1105,8 +1113,14 @@ mod tests {
         use crate::models::NewsHeadline;
         let data = crate::enrichment::EnrichmentData {
             news_headlines: vec![
-                NewsHeadline { title: "Headline 1".to_string(), published: Some(1700000000) },
-                NewsHeadline { title: "Headline 2".to_string(), published: None },
+                NewsHeadline {
+                    title: "Headline 1".to_string(),
+                    published: Some(1700000000),
+                },
+                NewsHeadline {
+                    title: "Headline 2".to_string(),
+                    published: None,
+                },
             ],
             ..Default::default()
         };

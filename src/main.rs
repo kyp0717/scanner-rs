@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 use scanner_rs::cli;
 use scanner_rs::config;
-use scanner_rs::tui;
+use scanner_rs::gui;
 
 #[derive(Parser)]
 #[command(name = "scanner", about = "TWS Momentum Stock Scanner")]
@@ -63,8 +63,8 @@ enum Commands {
         /// Subcommand: show
         what: Option<String>,
     },
-    /// Launch the interactive TUI
-    Tui {
+    /// Launch the interactive GUI
+    Gui {
         /// TWS host
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -110,12 +110,12 @@ fn main() -> Result<()> {
     let cli_args = Cli::parse();
 
     match cli_args.command {
-        // TUI mode: runs its own tokio runtime internally
-        Some(Commands::Tui { host, port }) => {
-            tui::run_tui(host, port)?;
+        // GUI mode: runs its own tokio runtime internally
+        Some(Commands::Gui { host, port }) => {
+            gui::run_gui(host, port).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         None => {
-            tui::run_tui("127.0.0.1".to_string(), None)?;
+            gui::run_gui("127.0.0.1".to_string(), None).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         // Alert mode: runs its own tokio runtime internally
@@ -163,7 +163,7 @@ async fn run_command(cmd: Commands) -> Result<()> {
             cli::cmd_config();
         }
 
-        Commands::Tui { .. } | Commands::Alert { .. } => unreachable!(),
+        Commands::Gui { .. } | Commands::Alert { .. } => unreachable!(),
     }
 
     Ok(())

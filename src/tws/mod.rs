@@ -4,6 +4,8 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::models::{ScanResult, DEFAULT_PORTS};
+use ibapi::contracts::tick_types::TickType;
+use ibapi::market_data::realtime::TickTypes;
 
 /// Build an ibapi ScannerSubscription from our parameters.
 fn build_subscription(
@@ -105,7 +107,7 @@ pub async fn run_scan(
         }
     };
 
-    let results = match subscription.next().await {
+    let mut results: Vec<ScanResult> = match subscription.next().await {
         Some(Ok(data)) => {
             let count = data.len();
             info!(scanner_code, count, "scanner results received");
@@ -119,6 +121,19 @@ pub async fn run_scan(
     };
 
     subscription.cancel().await;
+
+    // Fetch market data snapshots for price/change/volume
+    if !results.is_empty() {
+        let mut data_map: HashMap<String, ScanResult> = results
+            .into_iter()
+            .map(|r| (r.symbol.clone(), r))
+            .collect();
+        fetch_snapshots(&mut data_map, host, ports).await;
+        // Rebuild results preserving order by rank
+        results = data_map.into_values().collect();
+        results.sort_by_key(|r| r.rank);
+    }
+
     (results, Some(port))
 }
 
@@ -180,6 +195,117 @@ pub async fn run_poll_scan(
     }
 
     (symbol_scanners, symbol_data, Some(port))
+}
+
+/// Fetch market data snapshots for a batch of scan results.
+/// Populates last, bid, ask, volume, close, and computes change_pct.
+pub async fn fetch_snapshots(
+    results: &mut HashMap<String, ScanResult>,
+    host: &str,
+    ports: &[u16],
+) {
+    if results.is_empty() {
+        return;
+    }
+
+    // Use client_id 20 for snapshot requests
+    let (client, _port) = match connect(host, ports, 20).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Snapshot connect failed: {e}");
+            return;
+        }
+    };
+
+    let symbols: Vec<String> = results.keys().cloned().collect();
+    let mut fetched = 0usize;
+
+    for sym in &symbols {
+        let r = match results.get(sym) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let contract = ibapi::contracts::Contract {
+            symbol: ibapi::contracts::Symbol::from(sym.as_str()),
+            security_type: ibapi::contracts::SecurityType::Stock,
+            exchange: ibapi::contracts::Exchange::from("SMART"),
+            currency: ibapi::contracts::Currency::from(
+                if r.currency.is_empty() { "USD" } else { &r.currency },
+            ),
+            ..Default::default()
+        };
+
+        // Request snapshot (snapshot=true means one-shot, no streaming)
+        let mut subscription = match ibapi::market_data::realtime::market_data(
+            &client, &contract, &[], true, false,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(symbol = %sym, "snapshot request failed: {e}");
+                continue;
+            }
+        };
+
+        let mut last = None;
+        let mut close = None;
+        let mut volume = None;
+        let mut bid = None;
+        let mut ask = None;
+
+        // Drain ticks until SnapshotEnd or stream ends
+        while let Some(Ok(tick)) = subscription.next().await {
+            match tick {
+                TickTypes::SnapshotEnd => break,
+                TickTypes::Price(tp) => match tp.tick_type {
+                    TickType::Last => last = Some(tp.price),
+                    TickType::Close => close = Some(tp.price),
+                    TickType::Bid => bid = Some(tp.price),
+                    TickType::Ask => ask = Some(tp.price),
+                    _ => {}
+                },
+                TickTypes::PriceSize(tp) => match tp.price_tick_type {
+                    TickType::Last => last = Some(tp.price),
+                    TickType::Close => close = Some(tp.price),
+                    TickType::Bid => bid = Some(tp.price),
+                    TickType::Ask => ask = Some(tp.price),
+                    _ => {}
+                },
+                TickTypes::Size(ts) => {
+                    if ts.tick_type == TickType::Volume {
+                        volume = Some(ts.size as i64);
+                    }
+                }
+                TickTypes::Notice(_) => {}
+                _ => {}
+            }
+        }
+
+        // Update the ScanResult
+        if let Some(r) = results.get_mut(sym) {
+            if let Some(l) = last {
+                r.last = Some(l);
+            }
+            r.bid = bid;
+            r.ask = ask;
+            r.close = close;
+            if let Some(v) = volume {
+                r.volume = Some(v);
+            }
+            // Compute change_pct from last and close
+            if let (Some(l), Some(c)) = (r.last, r.close) {
+                if c > 0.0 {
+                    r.change_pct = Some((l - c) / c * 100.0);
+                    r.change = Some(l - c);
+                }
+            }
+            fetched += 1;
+        }
+    }
+
+    info!(fetched, total = symbols.len(), "market data snapshots");
 }
 
 /// Fetch scanner parameters XML from TWS.

@@ -6,11 +6,11 @@ use tracing::{info, warn};
 
 use crate::config::SupabaseConfig;
 use crate::enrichment::EnrichmentData;
-use crate::models::{NewsHeadline, Sighting};
+use crate::models::{NewsHeadline, TwsScan};
 
-const TABLE: &str = "sightings";
+const TABLE: &str = "tws_scans";
 
-/// Supabase REST API client for the sightings table.
+/// Supabase REST API client for the tws_scans table.
 #[derive(Clone)]
 pub struct SupabaseClient {
     client: Client,
@@ -296,19 +296,19 @@ impl SupabaseClient {
         })
     }
 
-    /// Get history (all sightings, ordered by first_seen DESC).
-    pub async fn get_history(&self, limit: u32) -> Result<Vec<Sighting>> {
+    /// Get history (all tws_scans, ordered by first_seen DESC).
+    pub async fn get_history(&self, limit: u32) -> Result<Vec<TwsScan>> {
         let query = format!("select=*&order=first_seen.desc&limit={limit}");
         let rows = self.select(&query).await?;
-        let sightings = rows
+        let scans = rows
             .into_iter()
             .filter_map(|v| serde_json::from_value(v).ok())
             .collect();
-        Ok(sightings)
+        Ok(scans)
     }
 
-    /// Get today's sightings (first_seen >= today midnight).
-    pub async fn get_today(&self) -> Result<Vec<Sighting>> {
+    /// Get today's tws_scans (first_seen >= today midnight).
+    pub async fn get_today(&self) -> Result<Vec<TwsScan>> {
         let today = Local::now()
             .date_naive()
             .and_hms_opt(0, 0, 0)
@@ -323,11 +323,11 @@ impl SupabaseClient {
 
         let query = format!("select=*&first_seen=gte.{midnight}&order=first_seen.desc");
         let rows = self.select(&query).await?;
-        let sightings = rows
+        let scans = rows
             .into_iter()
             .filter_map(|v| serde_json::from_value(v).ok())
             .collect();
-        Ok(sightings)
+        Ok(scans)
     }
 
     /// Clear all history. Returns count of deleted rows.
@@ -363,21 +363,21 @@ impl SupabaseClient {
     }
 }
 
-/// Print sightings as a formatted history table.
-pub fn print_history(sightings: &[Sighting], label: &str) {
-    if sightings.is_empty() {
+/// Print tws_scans as a formatted history table.
+pub fn print_history(scans: &[TwsScan], label: &str) {
+    if scans.is_empty() {
         println!("{label}: no stocks in history");
         return;
     }
 
-    println!("{label} -- {} stocks", sightings.len());
+    println!("{label} -- {} stocks", scans.len());
     println!(
         "{:<10}  {:<6}  {:>8}  {:>8}  {:>6}  {:<30}  {:>4}  {}",
         "Time", "Symbol", "Last", "Chg%", "RVol", "Scanners", "Hits", "Catalyst"
     );
     println!("{}", "-".repeat(100));
 
-    for s in sightings {
+    for s in scans {
         let time_str = local_time_str(&s.first_seen);
         let price = match s.last_price {
             Some(p) => format!("{p:.2}"),
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_print_history_with_data() {
-        let sightings = vec![Sighting {
+        let scans = vec![TwsScan {
             id: Some(1),
             symbol: "AAPL".to_string(),
             first_seen: "2024-01-15T14:30:00+00:00".to_string(),
@@ -466,7 +466,7 @@ mod tests {
             catalyst_time: None,
         }];
         // Should not panic
-        print_history(&sightings, "Today");
+        print_history(&scans, "Today");
     }
 }
 

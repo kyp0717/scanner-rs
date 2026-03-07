@@ -52,7 +52,7 @@ impl PartialOrd for EnrichRequest {
     }
 }
 
-/// Events emitted by the engine for consumers (CLI or TUI).
+/// Events emitted by the engine for consumers (CLI or GUI).
 pub enum EngineEvent {
     ScanComplete {
         scanner_code: String,
@@ -76,7 +76,7 @@ pub enum EngineEvent {
     },
 }
 
-/// Core alert engine — business logic shared by TUI and CLI.
+/// Core alert engine — business logic shared by GUI and CLI.
 pub struct AlertEngine {
     pub settings: Settings,
     pub alert_rows: Vec<AlertRow>,
@@ -247,6 +247,12 @@ impl AlertEngine {
                 info!(scanner = i + 1, total = ALERT_SCANNERS.len(), code, count, "scanner results");
             }
 
+            // Fetch market data snapshots for price/change/volume
+            if !symbol_data.is_empty() {
+                info!(symbols = symbol_data.len(), "fetching market data snapshots");
+                rt.block_on(tws::fetch_snapshots(&mut symbol_data, &host, &ports));
+            }
+
             let elapsed_secs = start.elapsed().as_secs_f64();
             info!(unique_stocks = symbol_data.len(), scanners_run, elapsed_secs, "poll scan complete");
 
@@ -372,6 +378,29 @@ impl AlertEngine {
                         }
                     }
 
+                    // Update price/volume for already-seen symbols
+                    for row in &mut self.alert_rows {
+                        if let Some(r) = symbol_data.get(&row.symbol) {
+                            if r.last.is_some() {
+                                row.last = r.last;
+                            }
+                            if r.change_pct.is_some() {
+                                row.change_pct = r.change_pct;
+                            }
+                            if r.volume.is_some() {
+                                row.volume = r.volume;
+                            }
+                            // Update scanner hits
+                            let hits = symbol_scanners
+                                .get(&row.symbol)
+                                .map(|s| s.len() as u32)
+                                .unwrap_or(row.scanner_hits);
+                            if hits > row.scanner_hits {
+                                row.scanner_hits = hits;
+                            }
+                        }
+                    }
+
                     // Sort alert rows
                     self.alert_rows.sort_by(|a, b| {
                         b.scanner_hits
@@ -467,9 +496,9 @@ impl AlertEngine {
         }
     }
 
-    /// Load today's sightings from Supabase and populate alert state.
+    /// Load today's tws_scans from Supabase and populate alert state.
     /// Returns (loaded_count, needs_enrichment_count).
-    pub fn init_from_sightings(&mut self, rt: &tokio::runtime::Handle) -> (usize, usize) {
+    pub fn init_from_tws_scans(&mut self, rt: &tokio::runtime::Handle) -> (usize, usize) {
         if let Some(ref db) = self.db {
             if let Ok(today) = rt.block_on(db.get_today()) {
                 let loaded = today.len();
@@ -535,7 +564,7 @@ impl AlertEngine {
                         self.queue_enrich(&s.symbol, n_scans);
                     }
                 }
-                info!(loaded, needs_enrich, "sightings loaded");
+                info!(loaded, needs_enrich, "tws_scans loaded");
                 return (loaded, needs_enrich);
             }
         }
