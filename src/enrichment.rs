@@ -15,7 +15,8 @@ async fn fetch_yahoo_info(client: &Client, symbol: &str) -> Result<Value> {
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .send()
-        .await?;
+        .await?
+        .error_for_status()?;
     let json: Value = resp.json().await?;
     Ok(json)
 }
@@ -29,7 +30,8 @@ async fn fetch_yahoo_news(client: &Client, symbol: &str) -> Result<Vec<Value>> {
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .send()
-        .await?;
+        .await?
+        .error_for_status()?;
     let json: Value = resp.json().await?;
     let news = json
         .get("news")

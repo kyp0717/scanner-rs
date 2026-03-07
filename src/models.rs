@@ -69,6 +69,7 @@ pub struct Sighting {
     pub rvol: Option<f64>,
     pub float_shares: Option<f64>,
     pub catalyst: Option<String>,
+    pub catalyst_time: Option<i64>,
     pub name: Option<String>,
     pub sector: Option<String>,
     // Enrichment cache fields
@@ -189,6 +190,7 @@ mod tests {
             short_pct: Some(0.15),
             avg_volume: Some(1_000_000),
             news_headlines: Some(r#"[{"title":"Headline 1","published":null}]"#.to_string()),
+            catalyst_time: None,
         };
         assert_eq!(s.industry, Some("Biotech".to_string()));
         assert_eq!(s.avg_volume, Some(1_000_000));

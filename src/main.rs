@@ -64,7 +64,14 @@ enum Commands {
         what: Option<String>,
     },
     /// Launch the interactive TUI
-    Tui,
+    Tui {
+        /// TWS host
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TWS port (auto-detects 7500/7497 if omitted)
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Stream momentum alerts to stdout (headless mode)
     Alert {
         /// TWS host
@@ -104,8 +111,11 @@ fn main() -> Result<()> {
 
     match cli_args.command {
         // TUI mode: runs its own tokio runtime internally
-        Some(Commands::Tui) | None => {
-            tui::run_tui()?;
+        Some(Commands::Tui { host, port }) => {
+            tui::run_tui(host, port)?;
+        }
+        None => {
+            tui::run_tui("127.0.0.1".to_string(), None)?;
         }
 
         // Alert mode: runs its own tokio runtime internally
@@ -153,7 +163,7 @@ async fn run_command(cmd: Commands) -> Result<()> {
             cli::cmd_config();
         }
 
-        Commands::Tui | Commands::Alert { .. } => unreachable!(),
+        Commands::Tui { .. } | Commands::Alert { .. } => unreachable!(),
     }
 
     Ok(())

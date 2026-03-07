@@ -192,6 +192,7 @@ impl SupabaseClient {
                     ("rvol", "rvol"),
                     ("float_shares", "float_shares"),
                     ("catalyst", "catalyst"),
+                    ("catalyst_time", "catalyst_time"),
                     ("name", "name"),
                     ("sector", "sector"),
                     ("industry", "industry"),
@@ -224,7 +225,7 @@ impl SupabaseClient {
                     "name": data.get("name").cloned().unwrap_or(Value::Null),
                     "sector": data.get("sector").cloned().unwrap_or(Value::Null),
                 });
-                for key in &["industry", "short_pct", "avg_volume", "news_headlines", "enriched_at"] {
+                for key in &["industry", "short_pct", "avg_volume", "catalyst_time", "news_headlines", "enriched_at"] {
                     if let Some(val) = data.get(key) {
                         if !val.is_null() {
                             insert[key] = val.clone();
@@ -250,7 +251,7 @@ impl SupabaseClient {
         max_age: std::time::Duration,
     ) -> Option<EnrichmentData> {
         let query = format!(
-            "select=name,sector,industry,float_shares,short_pct,avg_volume,catalyst,news_headlines,enriched_at&symbol=eq.{symbol}&limit=1"
+            "select=name,sector,industry,float_shares,short_pct,avg_volume,catalyst,catalyst_time,news_headlines,enriched_at&symbol=eq.{symbol}&limit=1"
         );
         let rows = self.select(&query).await.ok()?;
         let row = rows.into_iter().next()?;
@@ -290,7 +291,7 @@ impl SupabaseClient {
             short_pct: row.get("short_pct").and_then(|v| v.as_f64()),
             avg_volume: row.get("avg_volume").and_then(|v| v.as_i64()),
             catalyst: row.get("catalyst").and_then(|v| v.as_str()).map(String::from),
-            catalyst_time: None,
+            catalyst_time: row.get("catalyst_time").and_then(|v| v.as_i64()),
             news_headlines,
         })
     }
@@ -410,13 +411,7 @@ pub fn local_time_str(iso_ts: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(iso_ts)
         .or_else(|_| chrono::DateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%:z"))
         .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| {
-            if iso_ts.len() >= 8 {
-                iso_ts[..8].to_string()
-            } else {
-                "-".to_string()
-            }
-        })
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 #[cfg(test)]
@@ -433,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_local_time_str_invalid() {
-        assert_eq!(local_time_str("not-a-date"), "not-a-da");
+        assert_eq!(local_time_str("not-a-date"), "-");
     }
 
     #[test]
@@ -468,6 +463,7 @@ mod tests {
             short_pct: None,
             avg_volume: None,
             news_headlines: None,
+            catalyst_time: None,
         }];
         // Should not panic
         print_history(&sightings, "Today");

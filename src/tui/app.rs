@@ -22,6 +22,7 @@ use super::ui;
 pub enum Mode {
     Alert,
     Scan,
+    Log,
 }
 
 /// Application state for the TUI — thin wrapper around AlertEngine.
@@ -39,6 +40,8 @@ pub struct App {
     pub should_quit: bool,
     pub selected_alert_row: usize,
     pub scroll_offset: u16,
+    pub log_lines: Vec<String>,
+    pub log_scroll: u16,
 }
 
 impl App {
@@ -56,6 +59,8 @@ impl App {
             should_quit: false,
             selected_alert_row: 0,
             scroll_offset: 0,
+            log_lines: Vec::new(),
+            log_scroll: 0,
         }
     }
 
@@ -67,8 +72,9 @@ impl App {
             .map(|p| p.to_string())
             .unwrap_or_else(|| "auto".to_string());
         let mode_tag = match self.mode {
-            Mode::Alert => "[ALERT]",
-            Mode::Scan => "[SCAN]",
+            Mode::Alert => "[ALERT] Tab=Scan",
+            Mode::Scan => "[SCAN] Tab=Log",
+            Mode::Log => "[LOG] Tab=Alert",
         };
         self.title = format!(
             "Scanner REPL -- {}:{} {}",
@@ -83,6 +89,14 @@ impl App {
     fn clear_output(&mut self) {
         self.output_lines.clear();
         self.scroll_offset = 0;
+    }
+
+    fn push_log(&mut self, line: &str) {
+        let now = chrono::Local::now().format("%H:%M:%S");
+        self.log_lines.push(format!("[{now}] {line}"));
+        if self.log_lines.len() > 500 {
+            self.log_lines.remove(0);
+        }
     }
 
     fn record_command(&mut self, cmd: &str) {
@@ -407,6 +421,7 @@ impl App {
             let mode_str = match self.mode {
                 Mode::Alert => "alert",
                 Mode::Scan => "scan",
+                Mode::Log => "log",
             };
             self.push_output(&format!("  Mode: {mode_str}"));
             return;
@@ -420,8 +435,12 @@ impl App {
                 self.mode = Mode::Scan;
                 self.update_title();
             }
+            "log" => {
+                self.mode = Mode::Log;
+                self.update_title();
+            }
             _ => {
-                self.push_output("Usage: mode [alert|scan]");
+                self.push_output("Usage: mode [alert|scan|log]");
             }
         }
     }
@@ -433,6 +452,7 @@ impl App {
                 scanner_code,
                 results,
             } => {
+                self.push_log(&format!("Scan: {} -- {} results", scanner_code, results.len()));
                 self.clear_output();
                 if results.is_empty() {
                     self.push_output("No results.");
@@ -538,8 +558,13 @@ impl App {
             EngineEvent::PollCycleComplete {
                 total_stocks,
                 new_symbols,
-                ..
+                scanners_run,
+                elapsed_secs,
             } => {
+                self.push_log(&format!(
+                    "Poll: {} stocks, {} new, {} scanners ({:.1}s)",
+                    total_stocks, new_symbols.len(), scanners_run, elapsed_secs
+                ));
                 let now = chrono::Local::now().format("%H:%M:%S");
                 if new_symbols.is_empty() {
                     self.alert_line = format!(
@@ -565,10 +590,22 @@ impl App {
                     }
                 }
             }
-            EngineEvent::EnrichComplete { .. } => {
-                // Engine already updated alert_rows — nothing to do
+            EngineEvent::EnrichComplete { symbol } => {
+                // Find the enriched row and log details
+                if let Some(r) = self.engine.alert_rows.iter().find(|r| r.symbol == symbol) {
+                    let catalyst = r.catalyst.as_deref().unwrap_or("none");
+                    let float = r.float_shares.map(|f| {
+                        if f >= 1_000_000.0 { format!("{:.1}M", f / 1_000_000.0) }
+                        else if f >= 1_000.0 { format!("{:.0}K", f / 1_000.0) }
+                        else { format!("{f:.0}") }
+                    }).unwrap_or_else(|| "-".to_string());
+                    self.push_log(&format!("Enriched: {symbol} -- {catalyst} (float: {float})"));
+                } else {
+                    self.push_log(&format!("Enriched: {symbol}"));
+                }
             }
-            EngineEvent::PortDiscovered { .. } => {
+            EngineEvent::PortDiscovered { port } => {
+                self.push_log(&format!("Connected: port {port}"));
                 self.update_title();
             }
         }
@@ -576,7 +613,7 @@ impl App {
 }
 
 /// Run the TUI application. Creates its own tokio runtime for async ops.
-pub fn run_tui() -> Result<()> {
+pub fn run_tui(host: String, port: Option<u16>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let handle = rt.handle().clone();
 
@@ -599,7 +636,10 @@ pub fn run_tui() -> Result<()> {
         None
     };
 
-    let mut app = App::new(AlertEngine::new(enrich_tx, Settings::default(), db));
+    let mut settings = Settings::default();
+    settings.host = host;
+    settings.port = port;
+    let mut app = App::new(AlertEngine::new(enrich_tx, settings, db));
 
     // Spawn enrichment worker with Supabase cache support
     let _worker = crate::engine::spawn_enrichment_worker(
@@ -616,6 +656,10 @@ pub fn run_tui() -> Result<()> {
     // Initialize alerts from today's sightings
     app.engine.init_from_sightings(&handle);
 
+    // Auto-start polling so alerts flow immediately
+    let _ = app.engine.poll_on();
+    app.update_title();
+
     // Main event loop
     let mut poll_timer = std::time::Instant::now();
 
@@ -630,12 +674,16 @@ pub fn run_tui() -> Result<()> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.should_quit = true;
                     }
-                    KeyCode::Esc => {
-                        app.mode = Mode::Alert;
+                    KeyCode::Tab => {
+                        app.mode = match app.mode {
+                            Mode::Alert => Mode::Scan,
+                            Mode::Scan => Mode::Log,
+                            Mode::Log => Mode::Alert,
+                        };
                         app.update_title();
                     }
-                    KeyCode::Insert => {
-                        app.mode = Mode::Scan;
+                    KeyCode::Esc if app.mode != Mode::Alert => {
+                        app.mode = Mode::Alert;
                         app.update_title();
                     }
                     KeyCode::Enter if app.mode == Mode::Scan => {
@@ -702,10 +750,18 @@ pub fn run_tui() -> Result<()> {
                         }
                     }
                     KeyCode::PageUp => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                        if app.mode == Mode::Log {
+                            app.log_scroll = app.log_scroll.saturating_sub(10);
+                        } else {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                        }
                     }
                     KeyCode::PageDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(10);
+                        if app.mode == Mode::Log {
+                            app.log_scroll = app.log_scroll.saturating_add(10);
+                        } else {
+                            app.scroll_offset = app.scroll_offset.saturating_add(10);
+                        }
                     }
                     _ => {}
                 }
@@ -925,6 +981,14 @@ mod tests {
     }
 
     #[test]
+    fn test_mode_switch_log() {
+        let (mut app, rt) = app_with_rt();
+        let handle = rt.handle().clone();
+        app.handle_input("mode log", &handle);
+        assert_eq!(app.mode, Mode::Log);
+    }
+
+    #[test]
     fn test_poll_status_off() {
         let (mut app, rt) = app_with_rt();
         let handle = rt.handle().clone();
@@ -991,7 +1055,7 @@ mod tests {
         let mut app = new_app();
         app.mode = Mode::Alert;
         app.update_title();
-        assert!(app.title.contains("[ALERT]"));
+        assert!(app.title.contains("[ALERT] Tab=Scan"));
     }
 
     #[test]
@@ -999,7 +1063,15 @@ mod tests {
         let mut app = new_app();
         app.mode = Mode::Scan;
         app.update_title();
-        assert!(app.title.contains("[SCAN]"));
+        assert!(app.title.contains("[SCAN] Tab=Log"));
+    }
+
+    #[test]
+    fn test_update_title_log_mode() {
+        let mut app = new_app();
+        app.mode = Mode::Log;
+        app.update_title();
+        assert!(app.title.contains("[LOG] Tab=Alert"));
     }
 
     #[test]

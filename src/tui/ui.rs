@@ -50,7 +50,7 @@ fn draw_alert_line(f: &mut Frame, area: Rect, app: &App) {
 fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
     let prompt = match app.mode {
         Mode::Alert => Paragraph::new(Line::from(Span::styled(
-            " Insert=scan  Up/Down=navigate  Esc=back",
+            " Tab=Scan  Up/Down=navigate  Esc=back",
             Style::default().fg(Color::DarkGray),
         )))
         .style(Style::default().bg(Color::Black)),
@@ -58,6 +58,11 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("> scan  ", Style::default().fg(Color::Cyan)),
             Span::raw(&app.input),
         ]))
+        .style(Style::default().bg(Color::Black)),
+        Mode::Log => Paragraph::new(Line::from(Span::styled(
+            " Tab=Alert  PgUp/PgDn=scroll",
+            Style::default().fg(Color::DarkGray),
+        )))
         .style(Style::default().bg(Color::Black)),
     };
     f.render_widget(prompt, area);
@@ -88,12 +93,13 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
             draw_detail_panel(f, chunks[2], app);
         }
         Mode::Scan => draw_output(f, area, app),
+        Mode::Log => draw_log(f, area, app),
     }
 }
 
 fn draw_alert_table(f: &mut Frame, area: Rect, app: &App) {
     if app.engine.alert_rows.is_empty() {
-        let msg = Paragraph::new("No alerts yet. Press Insert for scan mode.")
+        let msg = Paragraph::new("No alerts yet. Tab=Scan")
             .style(Style::default().fg(Color::DarkGray).bg(Color::Black));
         f.render_widget(msg, area);
         return;
@@ -387,6 +393,27 @@ fn format_volume(vol: i64) -> String {
     } else {
         format!("{vol}")
     }
+}
+
+fn draw_log(f: &mut Frame, area: Rect, app: &App) {
+    if app.log_lines.is_empty() {
+        let msg = Paragraph::new("No log entries yet. Engine events will appear here.")
+            .style(Style::default().fg(Color::DarkGray).bg(Color::Black));
+        f.render_widget(msg, area);
+        return;
+    }
+
+    let lines: Vec<Line> = app
+        .log_lines
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    let output = Paragraph::new(lines)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .scroll((app.log_scroll, 0));
+
+    f.render_widget(output, area);
 }
 
 fn draw_output(f: &mut Frame, area: Rect, app: &App) {
