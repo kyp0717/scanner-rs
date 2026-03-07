@@ -257,32 +257,36 @@ pub async fn fetch_snapshots(
         let mut ask = None;
 
         // Drain ticks until SnapshotEnd or 3s timeout
+        let mut tick_count = 0u32;
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
         loop {
             match tokio::time::timeout_at(deadline, subscription.next()).await {
-                Ok(Some(Ok(tick))) => match tick {
-                    TickTypes::SnapshotEnd => break,
-                    TickTypes::Price(tp) => match tp.tick_type {
-                        TickType::Last => last = Some(tp.price),
-                        TickType::Close => close = Some(tp.price),
-                        TickType::Bid => bid = Some(tp.price),
-                        TickType::Ask => ask = Some(tp.price),
-                        _ => {}
-                    },
-                    TickTypes::PriceSize(tp) => match tp.price_tick_type {
-                        TickType::Last => last = Some(tp.price),
-                        TickType::Close => close = Some(tp.price),
-                        TickType::Bid => bid = Some(tp.price),
-                        TickType::Ask => ask = Some(tp.price),
-                        _ => {}
-                    },
-                    TickTypes::Size(ts) => {
-                        if ts.tick_type == TickType::Volume {
-                            volume = Some(ts.size as i64);
+                Ok(Some(Ok(tick))) => {
+                    tick_count += 1;
+                    match tick {
+                        TickTypes::SnapshotEnd => break,
+                        TickTypes::Price(tp) => match tp.tick_type {
+                            TickType::Last => last = Some(tp.price),
+                            TickType::Close => close = Some(tp.price),
+                            TickType::Bid => bid = Some(tp.price),
+                            TickType::Ask => ask = Some(tp.price),
+                            _ => {}
+                        },
+                        TickTypes::PriceSize(tp) => match tp.price_tick_type {
+                            TickType::Last => last = Some(tp.price),
+                            TickType::Close => close = Some(tp.price),
+                            TickType::Bid => bid = Some(tp.price),
+                            TickType::Ask => ask = Some(tp.price),
+                            _ => {}
+                        },
+                        TickTypes::Size(ts) => {
+                            if ts.tick_type == TickType::Volume {
+                                volume = Some(ts.size as i64);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Ok(Some(Err(_))) | Ok(None) => break,
                 Err(_) => {
                     debug!(symbol = %sym, "snapshot timeout");
@@ -290,6 +294,7 @@ pub async fn fetch_snapshots(
                 }
             }
         }
+        debug!(symbol = %sym, tick_count, last = ?last, close = ?close, "snapshot ticks");
 
         // Update the ScanResult
         if let Some(r) = results.get_mut(sym) {

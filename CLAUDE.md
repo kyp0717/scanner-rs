@@ -174,10 +174,24 @@ name, sector, industry, short_pct, avg_volume, news_headlines, enriched_at.
 
 ## Design Rules
 - **Modular code** — each module handles one concern, testable in isolation
-- **CLI for testing** — every module can be tested via CLI subcommands
+- **CLI-first testing** — ALWAYS verify data flow via CLI before integrating into GUI
 - **Dark theme** — dark background GUI aesthetic
 - **Keep it simple** — iced for layout, no over-engineering
 - **Tests first** — unit tests for all pure logic (filtering, classification, enrichment)
+
+## Testing Approach — CLI First (MANDATORY)
+Before integrating any data pipeline change into the GUI, **you MUST verify it
+works via CLI first**. The CLI subcommands exist specifically for this purpose.
+
+Testing checklist for data flow changes:
+1. `cargo test` — all unit tests pass
+2. `cargo run -- enrich AAPL TSLA` — verify Yahoo Finance enrichment returns data
+3. `cargo run -- scan gain --rows 5` — verify scanner returns results with prices
+4. `cargo run -- history` — verify Supabase reads work
+5. `cargo run -- alert` (briefly) — verify poll cycle produces events
+
+Only after CLI confirms data flows correctly should changes be wired into the GUI.
+If CLI shows "-" or empty data, fix the data layer first — don't debug in the GUI.
 
 ## Logging
 - **tracing** writes structured logs to `var/scanner.log` (rolling daily)
@@ -195,8 +209,20 @@ scanner parameters). No hand-rolled protocol code.
 
 ### Scanner Data + Market Snapshots
 The IB TWS scanner API (`ibapi::scanner::ScannerData`) only returns **contract
-data** (rank, contract_details, leg) — not market data. After each scan,
-`tws::fetch_snapshots()` makes snapshot `market_data` requests (one per symbol)
-to fetch last price, bid, ask, volume, and previous close. Change% is computed
-from last vs close. This runs in the same background thread as scanning, adding
-a few seconds to each poll cycle. Client ID 20 is used for snapshot connections.
+data** (rank, contract_details, leg) — not market data. For one-shot scans
+(`cargo run -- scan`), `tws::fetch_snapshots()` makes snapshot `market_data`
+requests (one per symbol, max 50, 3s timeout each) to fetch last price, bid,
+ask, volume, and previous close. Change% is computed from last vs close.
+Client ID 20 is used for snapshot connections. **Note:** Snapshots return no
+price data when market is closed — this is expected TWS behavior.
+
+Snapshots are NOT used during poll cycles (too many symbols would block the poll
+thread). Poll alert rows get prices updated when enrichment or future snapshot
+batching is added.
+
+### Yahoo Finance Auth
+Yahoo Finance API requires cookie + crumb authentication:
+1. GET `https://fc.yahoo.com` → extract `set-cookie` header
+2. GET `https://query2.finance.yahoo.com/v1/test/getcrumb` with cookie → get crumb
+3. Pass both cookie header + `&crumb=` query param on all API requests
+Auth is cached per session in the enrichment worker thread.

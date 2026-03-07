@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::enrichment::{fetch_enrichment, EnrichmentData};
+use crate::enrichment::{fetch_enrichment_with_auth, fetch_yahoo_auth, EnrichmentData, YahooAuth};
 use crate::history::SupabaseClient;
 use crate::models::*;
 use crate::tws;
@@ -580,6 +580,7 @@ pub fn spawn_enrichment_worker(
         let client = reqwest::Client::new();
         let mut heap = BinaryHeap::<EnrichRequest>::new();
         let mut enriched_set = HashSet::<String>::new();
+        let mut yahoo_auth: Option<YahooAuth> = None;
 
         loop {
             // Drain all pending requests into the priority queue
@@ -618,8 +619,19 @@ pub fn spawn_enrichment_worker(
                     info!(symbol = %req.symbol, "enrichment cache hit");
                     cached_data
                 } else {
-                    info!(symbol = %req.symbol, priority = req.scanner_hits, "enriching via Yahoo");
-                    rt_handle.block_on(fetch_enrichment(&client, &req.symbol))
+                    // Fetch or reuse Yahoo auth
+                    if yahoo_auth.is_none() {
+                        yahoo_auth = rt_handle.block_on(fetch_yahoo_auth(&client)).ok();
+                        if yahoo_auth.is_none() {
+                            warn!("Yahoo auth failed, skipping enrichment");
+                        }
+                    }
+                    if let Some(ref auth) = yahoo_auth {
+                        info!(symbol = %req.symbol, priority = req.scanner_hits, "enriching via Yahoo");
+                        rt_handle.block_on(fetch_enrichment_with_auth(&client, &req.symbol, auth))
+                    } else {
+                        EnrichmentData::default()
+                    }
                 };
 
                 let _ = bg_tx.send(BgMessage::EnrichComplete {

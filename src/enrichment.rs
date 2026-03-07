@@ -6,14 +6,81 @@ use tracing::{debug, warn};
 use crate::catalyst::classify_catalyst;
 use crate::models::{NewsHeadline, ScanResult};
 
-/// Fetch Yahoo Finance data for a single symbol.
-async fn fetch_yahoo_info(client: &Client, symbol: &str) -> Result<Value> {
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// Simple percent-encoding for URL query values.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+/// Yahoo Finance auth credentials (cookie + crumb).
+#[derive(Debug, Clone)]
+pub struct YahooAuth {
+    pub cookie: String,
+    pub crumb: String,
+}
+
+/// Fetch Yahoo Finance auth (cookie + crumb) required for API access.
+pub async fn fetch_yahoo_auth(client: &Client) -> Result<YahooAuth> {
+    // Step 1: Hit fc.yahoo.com to get set-cookie
+    let resp = client
+        .get("https://fc.yahoo.com")
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await?;
+
+    let cookies: String = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|c| c.split(';').next().unwrap_or("").trim().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if cookies.is_empty() {
+        anyhow::bail!("No cookies from fc.yahoo.com");
+    }
+
+    // Step 2: Fetch crumb using cookies
+    let crumb_resp = client
+        .get("https://query2.finance.yahoo.com/v1/test/getcrumb")
+        .header("User-Agent", USER_AGENT)
+        .header("Cookie", &cookies)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let crumb = crumb_resp.text().await?;
+    if crumb.is_empty() || crumb.contains("Too Many Requests") {
+        anyhow::bail!("Failed to get crumb: {crumb}");
+    }
+
+    Ok(YahooAuth { cookie: cookies, crumb })
+}
+
+/// Fetch Yahoo Finance data for a single symbol (with auth).
+async fn fetch_yahoo_info(client: &Client, symbol: &str, auth: &YahooAuth) -> Result<Value> {
     let url = format!(
-        "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=summaryProfile,defaultKeyStatistics,financialData,price"
+        "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{}?modules=summaryProfile,defaultKeyStatistics,financialData,price&crumb={}",
+        symbol,
+        percent_encode(&auth.crumb)
     );
     let resp = client
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", USER_AGENT)
+        .header("Cookie", &auth.cookie)
         .send()
         .await?
         .error_for_status()?;
@@ -21,14 +88,17 @@ async fn fetch_yahoo_info(client: &Client, symbol: &str) -> Result<Value> {
     Ok(json)
 }
 
-/// Fetch recent news for a symbol from Yahoo Finance.
-async fn fetch_yahoo_news(client: &Client, symbol: &str) -> Result<Vec<Value>> {
+/// Fetch recent news for a symbol from Yahoo Finance (with auth).
+async fn fetch_yahoo_news(client: &Client, symbol: &str, auth: &YahooAuth) -> Result<Vec<Value>> {
     let url = format!(
-        "https://query1.finance.yahoo.com/v8/finance/search?q={symbol}&newsCount=5&quotesCount=0"
+        "https://query2.finance.yahoo.com/v8/finance/search?q={}&newsCount=5&quotesCount=0&crumb={}",
+        symbol,
+        percent_encode(&auth.crumb)
     );
     let resp = client
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", USER_AGENT)
+        .header("Cookie", &auth.cookie)
         .send()
         .await?
         .error_for_status()?;
@@ -71,13 +141,18 @@ pub struct EnrichmentData {
     pub news_headlines: Vec<NewsHeadline>,
 }
 
-/// Fetch enrichment data for a single symbol.
-pub async fn fetch_enrichment(client: &Client, symbol: &str) -> EnrichmentData {
+/// Fetch enrichment data for a single symbol (requires pre-fetched auth).
+pub async fn fetch_enrichment_with_auth(
+    client: &Client,
+    symbol: &str,
+    auth: &YahooAuth,
+) -> EnrichmentData {
     let mut data = EnrichmentData::default();
 
-    // Fetch info and news concurrently
-    let (info_result, news_result) =
-        tokio::join!(fetch_yahoo_info(client, symbol), fetch_yahoo_news(client, symbol));
+    let (info_result, news_result) = tokio::join!(
+        fetch_yahoo_info(client, symbol, auth),
+        fetch_yahoo_news(client, symbol, auth)
+    );
 
     if let Ok(info) = info_result {
         data.name = extract_str(&info, "price", "shortName");
@@ -113,18 +188,37 @@ pub async fn fetch_enrichment(client: &Client, symbol: &str) -> EnrichmentData {
     data
 }
 
+/// Fetch enrichment data for a single symbol (fetches auth internally).
+pub async fn fetch_enrichment(client: &Client, symbol: &str) -> EnrichmentData {
+    match fetch_yahoo_auth(client).await {
+        Ok(auth) => fetch_enrichment_with_auth(client, symbol, &auth).await,
+        Err(e) => {
+            warn!("Yahoo auth failed: {e}");
+            EnrichmentData::default()
+        }
+    }
+}
+
 /// Enrich a list of scan results with Yahoo Finance data.
-/// Runs enrichment concurrently for all symbols.
+/// Fetches auth once and reuses for all symbols.
 pub async fn enrich_results(results: &mut [ScanResult]) {
     let client = Client::new();
-    let symbols: Vec<String> = results.iter().map(|r| r.symbol.clone()).collect();
+
+    let auth = match fetch_yahoo_auth(&client).await {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("Yahoo auth failed, skipping enrichment: {e}");
+            return;
+        }
+    };
 
     let mut handles = Vec::new();
-    for symbol in &symbols {
+    for r in results.iter() {
         let client = client.clone();
-        let symbol = symbol.clone();
+        let symbol = r.symbol.clone();
+        let auth = auth.clone();
         handles.push(tokio::spawn(async move {
-            fetch_enrichment(&client, &symbol).await
+            fetch_enrichment_with_auth(&client, &symbol, &auth).await
         }));
     }
 
@@ -138,7 +232,6 @@ pub async fn enrich_results(results: &mut [ScanResult]) {
             r.short_pct = data.short_pct;
             r.avg_volume = data.avg_volume;
             r.catalyst = data.catalyst;
-            // Calculate relative volume
             if let (Some(vol), Some(avg)) = (r.volume, data.avg_volume) {
                 if avg > 0 {
                     r.rvol = Some(vol as f64 / avg as f64);
