@@ -37,7 +37,7 @@ pub async fn cmd_scan(
         .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
 
     if code.to_lowercase() == "list" {
-        match tws::fetch_scanner_params(host, &ports, 3) {
+        match tws::fetch_scanner_params(host, &ports, 3).await {
             Some(xml) => tws::print_scanner_params(&xml, None),
             None => eprintln!("Could not connect to TWS"),
         }
@@ -45,7 +45,7 @@ pub async fn cmd_scan(
     }
 
     let (mut results, _port) =
-        tws::run_scan(&scanner_code, host, &ports, 1, rows, Some(min_price), max_price);
+        tws::run_scan(&scanner_code, host, &ports, 1, rows, Some(min_price), max_price).await;
 
     if !results.is_empty() {
         println!("Enriching with Yahoo Finance...");
@@ -61,7 +61,7 @@ pub async fn cmd_list(group: Option<&str>, host: &str, port: Option<u16>) -> Res
     let ports: Vec<u16> = port
         .map(|p| vec![p])
         .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-    match tws::fetch_scanner_params(host, &ports, 3) {
+    match tws::fetch_scanner_params(host, &ports, 3).await {
         Some(xml) => tws::print_scanner_params(&xml, group),
         None => eprintln!("Could not connect to TWS"),
     }

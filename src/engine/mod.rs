@@ -142,8 +142,10 @@ impl AlertEngine {
         let code = code.to_string();
 
         std::thread::spawn(move || {
-            let (results, port) =
-                tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let (results, port) = rt.block_on(
+                tws::run_scan(&code, &host, &ports, 1, rows, min_price, max_price),
+            );
             let _ = tx.send(BgMessage::ScanComplete {
                 scanner_code: code,
                 results,
@@ -168,7 +170,8 @@ impl AlertEngine {
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
-            let xml = tws::fetch_scanner_params(&host, &ports, 3);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let xml = rt.block_on(tws::fetch_scanner_params(&host, &ports, 3));
             let _ = tx.send(BgMessage::ListComplete { xml, group });
         });
     }
@@ -216,6 +219,7 @@ impl AlertEngine {
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let start = std::time::Instant::now();
             let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
             let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
@@ -223,8 +227,9 @@ impl AlertEngine {
             let mut scanners_run = 0usize;
 
             for (i, &(code, cid)) in ALERT_SCANNERS.iter().enumerate() {
-                let (results, port) =
-                    tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0));
+                let (results, port) = rt.block_on(
+                    tws::run_scan(code, &host, &ports, cid, 50, Some(1.0), Some(20.0)),
+                );
                 if connected_port.is_none() {
                     connected_port = port;
                 }
@@ -396,6 +401,7 @@ impl AlertEngine {
                             "name": &data.name,
                             "sector": &data.sector,
                             "catalyst": &data.catalyst,
+                            "catalyst_time": data.catalyst_time,
                             "float_shares": data.float_shares,
                             "industry": &data.industry,
                             "short_pct": data.short_pct,
@@ -455,9 +461,9 @@ impl AlertEngine {
             .port
             .map(|p| vec![p])
             .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
-        if let Ok(client) = tws::TwsClient::connect(&self.settings.host, &ports, 0) {
-            self.connected_port = Some(client.connected_port);
-            client.disconnect();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        if let Some(port) = rt.block_on(tws::probe_port(&self.settings.host, &ports)) {
+            self.connected_port = Some(port);
         }
     }
 
@@ -518,7 +524,7 @@ impl AlertEngine {
                         sector: s.sector.clone(),
                         industry: s.industry.clone(),
                         catalyst: s.catalyst.clone(),
-                        catalyst_time: None,
+                        catalyst_time: s.catalyst_time,
                         scanner_hits: n_scans,
                         news_headlines,
                         enriched: enrichment_fresh,

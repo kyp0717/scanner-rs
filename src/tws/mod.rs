@@ -1,590 +1,83 @@
-pub mod messages;
-
-use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::HashMap;
 
 use anyhow::Result;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::models::{ScanResult, DEFAULT_PORTS};
-use messages::*;
 
-/// State shared between the reader thread and main thread.
-#[derive(Debug, Default)]
-struct TwsState {
-    connected: bool,
-    #[allow(dead_code)]
-    server_version: Option<i32>,
-    results: HashMap<i32, ScanResult>,
-    contracts: HashMap<i32, (i64, String, String)>, // req_id -> (conId, symbol, currency)
-    scanner_done: bool,
-    scanners_done: HashSet<i32>,
-    scanner_results: HashMap<i32, Vec<ScanResult>>, // scanner req_id -> results
-    scanner_params_xml: Option<String>,
-    scanner_params_done: bool,
-    next_req_id: i32,
-}
-
-/// TWS client that connects to Interactive Brokers TWS/IB Gateway.
-pub struct TwsClient {
-    writer: BufWriter<TcpStream>,
-    state: Arc<Mutex<TwsState>>,
-    _reader_handle: std::thread::JoinHandle<()>,
-    pub connected_port: u16,
-}
-
-impl TwsClient {
-    /// Connect to TWS, trying ports in order. Returns connected client.
-    pub fn connect(host: &str, ports: &[u16], client_id: i32) -> Result<Self> {
-        let ports = if ports.is_empty() { DEFAULT_PORTS } else { ports };
-
-        for &port in ports {
-            // Quick TCP check
-            match TcpStream::connect_timeout(
-                &format!("{host}:{port}").parse().unwrap(),
-                Duration::from_secs(2),
-            ) {
-                Ok(stream) => {
-                    match Self::handshake(stream, client_id, port) {
-                        Ok(client) => {
-                            info!("Connected to TWS on port {port}");
-                            eprintln!("Connected to TWS on port {port}");
-                            return Ok(client);
-                        }
-                        Err(e) => {
-                            debug!("Handshake failed on port {port}: {e}");
-                            continue;
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-
-        anyhow::bail!(
-            "Could not connect on any port: {}",
-            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-        )
-    }
-
-    fn handshake(stream: TcpStream, client_id: i32, port: u16) -> Result<Self> {
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        let read_stream = stream.try_clone()?;
-
-        let mut writer = BufWriter::new(stream);
-
-        // Send handshake
-        let handshake = build_handshake();
-        writer.write_all(&handshake)?;
-        writer.flush()?;
-
-        // Read server response: 4-byte big-endian length prefix, then payload
-        let mut reader = BufReader::new(read_stream);
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf)?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; msg_len];
-        reader.read_exact(&mut payload)?;
-
-        // Payload contains null-separated fields: server_version \0 server_time \0
-        let mut fields = payload.split(|&b| b == 0).filter(|f| !f.is_empty());
-        let version_str = fields
-            .next()
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .unwrap_or_default();
-        let time_str = fields
-            .next()
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .unwrap_or_default();
-        let server_version: i32 = version_str.trim().parse().unwrap_or(0);
-        debug!("Server version: {server_version}");
-        debug!("Server time: {time_str}");
-
-        // Send START_API
-        let start_msg = build_start_api(client_id);
-        writer.write_all(&start_msg)?;
-        writer.flush()?;
-
-        let state = Arc::new(Mutex::new(TwsState {
-            server_version: Some(server_version),
-            next_req_id: 1000,
-            ..Default::default()
-        }));
-
-        // Start reader thread
-        let state_clone = Arc::clone(&state);
-        let reader_handle = std::thread::spawn(move || {
-            Self::reader_loop(reader, state_clone);
-        });
-
-        // Wait for nextValidId (connection confirmation)
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > Duration::from_secs(10) {
-                anyhow::bail!("Timeout waiting for connection confirmation");
-            }
-            {
-                let s = state.lock().unwrap();
-                if s.connected {
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        Ok(Self {
-            writer,
-            state,
-            _reader_handle: reader_handle,
-            connected_port: port,
-        })
-    }
-
-    fn reader_loop(mut reader: BufReader<TcpStream>, state: Arc<Mutex<TwsState>>) {
-        loop {
-            match read_message(&mut reader) {
-                Ok(fields) => {
-                    if fields.is_empty() {
-                        continue;
-                    }
-                    Self::process_message(&fields, &state);
-                }
-                Err(e) => {
-                    debug!("Reader loop ended: {e}");
-                    break;
-                }
-            }
-        }
-    }
-
-    fn process_message(fields: &[String], state: &Arc<Mutex<TwsState>>) {
-        if fields.is_empty() {
-            return;
-        }
-        let msg_type = &fields[0];
-
-        match msg_type.as_str() {
-            in_msg::NEXT_VALID_ID => {
-                let mut s = state.lock().unwrap();
-                s.connected = true;
-                debug!("Received nextValidId — connected");
-            }
-            in_msg::ERR_MSG => {
-                // fields: [msg_type, version, req_id, error_code, error_string, ...]
-                if fields.len() >= 5 {
-                    let error_code: i32 = fields[3].parse().unwrap_or(-1);
-                    let error_string = &fields[4];
-
-                    if error_code == 502 {
-                        error!("Cannot connect to TWS. Make sure TWS/IB Gateway is running.");
-                    } else if !NONFATAL_ERRORS.contains(&error_code) {
-                        let req_id: i32 = fields[2].parse().unwrap_or(-1);
-                        let s = state.lock().unwrap();
-                        if let Some(result) = s.results.get(&req_id) {
-                            warn!("{}: Error {} - {}", result.symbol, error_code, error_string);
-                        } else {
-                            warn!(req_id, error_code, error_string, "TWS error");
-                        }
-                    }
-                }
-            }
-            in_msg::SCANNER_DATA => {
-                Self::handle_scanner_data(fields, state);
-            }
-            in_msg::SCANNER_PARAMETERS => {
-                // fields: [msg_type, version, xml]
-                if fields.len() >= 3 {
-                    let mut s = state.lock().unwrap();
-                    s.scanner_params_xml = Some(fields[2].clone());
-                    s.scanner_params_done = true;
-                }
-            }
-            in_msg::TICK_PRICE => {
-                Self::handle_tick_price(fields, state);
-            }
-            in_msg::TICK_SIZE => {
-                Self::handle_tick_size(fields, state);
-            }
-            _ => {
-                // Ignore unknown message types
-            }
-        }
-    }
-
-    fn handle_scanner_data(fields: &[String], state: &Arc<Mutex<TwsState>>) {
-        // Scanner data format (v3):
-        // [msg_type, version, req_id, num_elements, then for each:
-        //  rank, conId, symbol, secType, lastTradeDateOrContractMonth,
-        //  strike, right, exchange, currency, localSymbol, marketName,
-        //  tradingClass, distance, benchmark, projection, legsStr]
-        if fields.len() < 4 {
-            return;
-        }
-        let version: i32 = fields[1].parse().unwrap_or(0);
-        let req_id: i32 = fields[2].parse().unwrap_or(0);
-        let num_elements: i32 = fields[3].parse().unwrap_or(0);
-
-        let mut idx = 4;
-        let mut s = state.lock().unwrap();
-        for _ in 0..num_elements.max(0) {
-            if idx + 15 >= fields.len() {
-                break;
-            }
-            let rank: u32 = fields[idx].parse().unwrap_or(0);
-            let con_id: i64 = fields[idx + 1].parse().unwrap_or(0);
-            let symbol = fields[idx + 2].clone();
-            let _sec_type = &fields[idx + 3];
-            // Skip several fields to get to exchange and currency
-            let exchange = if idx + 7 < fields.len() {
-                fields[idx + 7].clone()
-            } else {
-                "SMART".to_string()
-            };
-            let currency = if idx + 8 < fields.len() {
-                fields[idx + 8].clone()
-            } else {
-                "USD".to_string()
-            };
-
-            let mkt_req_id = s.next_req_id + rank as i32;
-            let result = ScanResult {
-                rank: rank + 1,
-                symbol: symbol.clone(),
-                con_id,
-                exchange: if exchange.is_empty() {
-                    "SMART".to_string()
-                } else {
-                    exchange.clone()
-                },
-                currency: currency.clone(),
-                ..Default::default()
-            };
-            s.scanner_results
-                .entry(req_id)
-                .or_default()
-                .push(result.clone());
-            s.results.insert(mkt_req_id, result);
-            s.contracts
-                .insert(mkt_req_id, (con_id, symbol, currency));
-
-            // Each scanner result has 16 fields (for v3)
-            idx += if version >= 3 { 16 } else { 14 };
-        }
-
-        // Scanner data message includes all elements — mark done after processing
-        let count = s.scanner_results.get(&req_id).map(|v| v.len()).unwrap_or(0);
-        info!(req_id, count, "scanner done");
-        s.scanner_done = true;
-        s.scanners_done.insert(req_id);
-    }
-
-    fn handle_tick_price(fields: &[String], state: &Arc<Mutex<TwsState>>) {
-        // fields: [msg_type, version, req_id, tick_type, price, ...]
-        if fields.len() < 5 {
-            return;
-        }
-        let req_id: i32 = fields[2].parse().unwrap_or(-1);
-        let tick_type_id: i32 = fields[3].parse().unwrap_or(-1);
-        let price: f64 = fields[4].parse().unwrap_or(0.0);
-
-        if price <= 0.0 {
-            return;
-        }
-
-        let mut s = state.lock().unwrap();
-        if let Some(r) = s.results.get_mut(&req_id) {
-            match tick_type_id {
-                tick_type::BID | tick_type::DELAYED_BID => r.bid = Some(price),
-                tick_type::ASK | tick_type::DELAYED_ASK => r.ask = Some(price),
-                tick_type::LAST | tick_type::DELAYED_LAST => {
-                    r.last = Some(price);
-                    if let Some(close) = r.close {
-                        if close > 0.0 {
-                            r.change = Some(price - close);
-                            r.change_pct = Some(((price - close) / close) * 100.0);
-                        }
-                    }
-                }
-                tick_type::CLOSE | tick_type::DELAYED_CLOSE => {
-                    r.close = Some(price);
-                    if let Some(last) = r.last {
-                        if price > 0.0 {
-                            r.change = Some(last - price);
-                            r.change_pct = Some(((last - price) / price) * 100.0);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn handle_tick_size(fields: &[String], state: &Arc<Mutex<TwsState>>) {
-        // fields: [msg_type, version, req_id, tick_type, size]
-        if fields.len() < 5 {
-            return;
-        }
-        let req_id: i32 = fields[2].parse().unwrap_or(-1);
-        let tick_type_id: i32 = fields[3].parse().unwrap_or(-1);
-        let size: i64 = fields[4].parse().unwrap_or(0);
-
-        if tick_type_id == tick_type::VOLUME || tick_type_id == tick_type::DELAYED_VOLUME {
-            let mut s = state.lock().unwrap();
-            if let Some(r) = s.results.get_mut(&req_id) {
-                r.volume = Some(size);
-            }
-        }
-    }
-
-    /// Request market data type (e.g., 4 for delayed frozen).
-    pub fn req_market_data_type(&mut self, data_type: i32) -> Result<()> {
-        write_message(
-            &mut self.writer,
-            &[out_msg::REQ_MKT_DATA_TYPE, "1", &data_type.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// Request a scanner subscription.
-    pub fn req_scanner_subscription(
-        &mut self,
-        req_id: i32,
-        scan_code: &str,
-        rows: u32,
-        min_price: Option<f64>,
-        max_price: Option<f64>,
-    ) -> Result<()> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(out_msg::REQ_SCANNER_SUBSCRIPTION.as_bytes());
-        payload.push(0);
-        // v100+ protocol: no version field
-        payload.extend_from_slice(req_id.to_string().as_bytes());
-        payload.push(0);
-        payload.extend_from_slice(rows.to_string().as_bytes()); // numberOfRows
-        payload.push(0);
-        payload.extend_from_slice(b"STK"); // instrument
-        payload.push(0);
-        payload.extend_from_slice(b"STK.US.MAJOR"); // locationCode
-        payload.push(0);
-        payload.extend_from_slice(scan_code.as_bytes()); // scanCode
-        payload.push(0);
-
-        // Price/volume filters in fixed fields
-        if let Some(min_p) = min_price {
-            payload.extend_from_slice(format!("{min_p}").as_bytes());
-        }
-        payload.push(0); // abovePrice
-        if let Some(max_p) = max_price {
-            payload.extend_from_slice(format!("{max_p}").as_bytes());
-        }
-        payload.push(0); // belowPrice
-        payload.extend_from_slice(b"100000"); // aboveVolume
-        payload.push(0);
-        payload.push(0); // marketCapAbove
-        payload.push(0); // marketCapBelow
-        payload.push(0); // moodyRatingAbove
-        payload.push(0); // moodyRatingBelow
-        payload.push(0); // spRatingAbove
-        payload.push(0); // spRatingBelow
-        payload.push(0); // maturityDateAbove
-        payload.push(0); // maturityDateBelow
-        payload.push(0); // couponRateAbove
-        payload.push(0); // couponRateBelow
-        payload.push(0); // excludeConvertible
-        payload.push(0); // averageOptionVolumeAbove (v4+)
-        payload.push(0); // scannerSettingPairs (v4+)
-        payload.push(0); // stockTypeFilter (v4+)
-
-        // Field [23]: scannerSubscriptionOptions (empty)
-        payload.push(0);
-
-        // Field [24]: scannerSubscriptionFilterOptions (empty — filters in fixed fields)
-        payload.push(0);
-
-        let len = payload.len() as u32;
-        self.writer.write_all(&len.to_be_bytes())?;
-        self.writer.write_all(&payload)?;
-        self.writer.flush()?;
-
-        Ok(())
-    }
-
-    /// Cancel a scanner subscription.
-    pub fn cancel_scanner_subscription(&mut self, req_id: i32) -> Result<()> {
-        write_message(
-            &mut self.writer,
-            &[
-                out_msg::CANCEL_SCANNER_SUBSCRIPTION,
-                "1",
-                &req_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Request scanner parameters XML.
-    pub fn req_scanner_parameters(&mut self) -> Result<()> {
-        write_message(&mut self.writer, &[out_msg::REQ_SCANNER_PARAMETERS, "1"])?;
-        Ok(())
-    }
-
-    /// Request market data for all scanner results.
-    pub fn request_market_data(&mut self) -> Result<()> {
-        let contracts: Vec<(i32, i64, String, String)> = {
-            let s = self.state.lock().unwrap();
-            s.contracts
-                .iter()
-                .map(|(&req_id, (con_id, symbol, currency))| {
-                    (req_id, *con_id, symbol.clone(), currency.clone())
-                })
-                .collect()
-        };
-
-        for (req_id, con_id, symbol, currency) in contracts {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(out_msg::REQ_MKT_DATA.as_bytes());
-            payload.push(0);
-            payload.extend_from_slice(b"11"); // version
-            payload.push(0);
-            payload.extend_from_slice(req_id.to_string().as_bytes());
-            payload.push(0);
-            payload.extend_from_slice(con_id.to_string().as_bytes()); // conId
-            payload.push(0);
-            payload.extend_from_slice(symbol.as_bytes()); // symbol
-            payload.push(0);
-            payload.extend_from_slice(b"STK"); // secType
-            payload.push(0);
-            payload.push(0); // lastTradeDateOrContractMonth
-            payload.push(0); // strike
-            payload.push(0); // right
-            payload.push(0); // multiplier
-            payload.extend_from_slice(b"SMART"); // exchange
-            payload.push(0);
-            payload.push(0); // primaryExch
-            payload.extend_from_slice(currency.as_bytes()); // currency
-            payload.push(0);
-            payload.push(0); // localSymbol
-            payload.push(0); // tradingClass
-            payload.push(0); // genericTickList
-            payload.extend_from_slice(b"0"); // snapshot
-            payload.push(0);
-            payload.extend_from_slice(b"0"); // regulatorySnapshot
-            payload.push(0);
-            payload.push(0); // mktDataOptions tag count = 0
-            payload.push(0);
-
-            let len = payload.len() as u32;
-            self.writer.write_all(&len.to_be_bytes())?;
-            self.writer.write_all(&payload)?;
-        }
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    /// Cancel market data for all contracts.
-    pub fn cancel_market_data(&mut self) -> Result<()> {
-        let req_ids: Vec<i32> = {
-            let s = self.state.lock().unwrap();
-            s.contracts.keys().copied().collect()
-        };
-        for req_id in req_ids {
-            write_message(
-                &mut self.writer,
-                &[out_msg::CANCEL_MKT_DATA, "2", &req_id.to_string()],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Wait for all given scanner req_ids to complete.
-    pub fn wait_all_scanners_done(&self, req_ids: &[i32], timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
-                let s = self.state.lock().unwrap();
-                let done = s.scanners_done.len();
-                let total = req_ids.len();
-                warn!(done, total, "poll scan timeout — got {done}/{total} scanners");
-                return false;
-            }
-            {
-                let s = self.state.lock().unwrap();
-                if req_ids.iter().all(|id| s.scanners_done.contains(id)) {
-                    return true;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Get results for a specific scanner req_id.
-    pub fn get_scanner_results(&self, req_id: i32) -> Vec<ScanResult> {
-        let s = self.state.lock().unwrap();
-        s.scanner_results.get(&req_id).cloned().unwrap_or_default()
-    }
-
-    /// Wait for scanner to complete, returns true if data received.
-    pub fn wait_scanner_done(&self, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
-                return false;
-            }
-            {
-                let s = self.state.lock().unwrap();
-                if s.scanner_done {
-                    return true;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Wait for scanner parameters to be received.
-    pub fn wait_scanner_params(&self, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
-                return false;
-            }
-            {
-                let s = self.state.lock().unwrap();
-                if s.scanner_params_done {
-                    return true;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Get scanner parameters XML.
-    pub fn get_scanner_params_xml(&self) -> Option<String> {
-        let s = self.state.lock().unwrap();
-        s.scanner_params_xml.clone()
-    }
-
-    /// Get results sorted by rank.
-    pub fn get_results(&self) -> Vec<ScanResult> {
-        let s = self.state.lock().unwrap();
-        let mut results: Vec<ScanResult> = s.results.values().cloned().collect();
-        results.sort_by_key(|r| r.rank);
-        results
-    }
-
-    /// Disconnect from TWS.
-    pub fn disconnect(self) {
-        // Writer goes out of scope, closing the connection.
-        // Reader thread will detect the closed connection and exit.
-        drop(self.writer);
+/// Build an ibapi ScannerSubscription from our parameters.
+fn build_subscription(
+    scan_code: &str,
+    rows: u32,
+    min_price: Option<f64>,
+    max_price: Option<f64>,
+) -> ibapi::scanner::ScannerSubscription {
+    ibapi::scanner::ScannerSubscription {
+        number_of_rows: rows as i32,
+        instrument: Some("STK".to_string()),
+        location_code: Some("STK.US.MAJOR".to_string()),
+        scan_code: Some(scan_code.to_string()),
+        above_price: min_price,
+        below_price: max_price,
+        above_volume: Some(100_000),
+        ..Default::default()
     }
 }
 
-/// Run a scanner subscription and return enriched results with the connected port.
-pub fn run_scan(
+/// Convert ibapi ScannerData to our ScanResult.
+fn scanner_data_to_result(data: &ibapi::scanner::ScannerData) -> ScanResult {
+    let c = &data.contract_details.contract;
+    let name = if data.contract_details.long_name.is_empty() {
+        None
+    } else {
+        Some(data.contract_details.long_name.clone())
+    };
+    ScanResult {
+        rank: (data.rank + 1) as u32,
+        symbol: c.symbol.to_string(),
+        con_id: c.contract_id as i64,
+        exchange: if c.primary_exchange.to_string().is_empty() {
+            "SMART".to_string()
+        } else {
+            c.primary_exchange.to_string()
+        },
+        currency: c.currency.to_string(),
+        name,
+        ..Default::default()
+    }
+}
+
+/// Try connecting to TWS on the given ports, return the first successful client and port.
+async fn connect(
+    host: &str,
+    ports: &[u16],
+    client_id: i32,
+) -> Result<(ibapi::Client, u16)> {
+    let ports = if ports.is_empty() { DEFAULT_PORTS } else { ports };
+
+    for &port in ports {
+        let addr = format!("{host}:{port}");
+        match ibapi::Client::connect(&addr, client_id).await {
+            Ok(client) => {
+                info!("Connected to TWS on port {port}");
+                eprintln!("Connected to TWS on port {port}");
+                return Ok((client, port));
+            }
+            Err(e) => {
+                debug!("Connection failed on port {port}: {e}");
+                continue;
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Could not connect on any port: {}",
+        ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Run a scanner subscription and return results with the connected port.
+pub async fn run_scan(
     scanner_code: &str,
     host: &str,
     ports: &[u16],
@@ -595,94 +88,84 @@ pub fn run_scan(
 ) -> (Vec<ScanResult>, Option<u16>) {
     eprintln!("Scanning {scanner_code} (rows={rows})...");
 
-    let mut client = match TwsClient::connect(host, ports, client_id) {
+    let (client, port) = match connect(host, ports, client_id).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
             return (vec![], None);
         }
     };
-    let port = client.connected_port;
 
-    // Request delayed frozen data
-    if let Err(e) = client.req_market_data_type(4) {
-        eprintln!("Failed to set market data type: {e}");
-    }
+    let sub = build_subscription(scanner_code, rows, min_price, max_price);
+    let mut subscription = match client.scanner_subscription(&sub, &vec![]).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to request scanner: {e}");
+            return (vec![], Some(port));
+        }
+    };
 
-    // Request scanner subscription
-    if let Err(e) = client.req_scanner_subscription(1, scanner_code, rows, min_price, max_price) {
-        eprintln!("Failed to request scanner: {e}");
-        client.disconnect();
-        return (vec![], Some(port));
-    }
+    let results = match subscription.next().await {
+        Some(Ok(data)) => {
+            let count = data.len();
+            info!(scanner_code, count, "scanner results received");
+            data.iter().map(|d| scanner_data_to_result(d)).collect()
+        }
+        Some(Err(e)) => {
+            eprintln!("Scanner error: {e}");
+            vec![]
+        }
+        None => vec![],
+    };
 
-    // Wait for scanner results
-    if !client.wait_scanner_done(Duration::from_secs(30)) {
-        eprintln!("Timeout waiting for scanner results");
-        client.disconnect();
-        return (vec![], Some(port));
-    }
-
-    // Request market data for all results
-    eprintln!("Waiting for market data...");
-    if let Err(e) = client.request_market_data() {
-        eprintln!("Failed to request market data: {e}");
-    }
-    std::thread::sleep(Duration::from_secs(5));
-
-    // Cancel market data
-    let _ = client.cancel_market_data();
-    std::thread::sleep(Duration::from_millis(500));
-
-    let results = client.get_results();
-    client.disconnect();
+    subscription.cancel().await;
     (results, Some(port))
 }
 
-/// Run multiple scanner subscriptions over a single TWS connection (no market data).
+/// Run multiple scanner subscriptions over a single TWS connection.
 /// Returns (symbol_scanners, symbol_data, connected_port).
-pub fn run_poll_scan(
+pub async fn run_poll_scan(
     scanners: &[(&str, i32)],
     host: &str,
     ports: &[u16],
-    client_id: i32,
+    _client_id: i32,
     rows: u32,
     min_price: Option<f64>,
     max_price: Option<f64>,
 ) -> (HashMap<String, Vec<String>>, HashMap<String, ScanResult>, Option<u16>) {
-    let mut client = match TwsClient::connect(host, ports, client_id) {
+    // Use client_id 10 for the shared connection
+    let (client, port) = match connect(host, ports, 10).await {
         Ok(c) => c,
         Err(e) => {
             warn!("Poll scan connect failed: {e}");
             return (HashMap::new(), HashMap::new(), None);
         }
     };
-    let port = client.connected_port;
 
-    // Send all scanner subscriptions with different req_ids
-    let req_ids: Vec<i32> = scanners
-        .iter()
-        .enumerate()
-        .map(|(i, _)| (i + 1) as i32)
-        .collect();
-
-    for (i, &(code, _cid)) in scanners.iter().enumerate() {
-        let req_id = req_ids[i];
-        if let Err(e) = client.req_scanner_subscription(req_id, code, rows, min_price, max_price) {
-            warn!(code, "failed to subscribe scanner: {e}");
-        }
-    }
-
-    // Wait for all scanners to complete (10s timeout)
-    client.wait_all_scanners_done(&req_ids, Duration::from_secs(10));
-
-    // Collect results: symbol -> scanners, symbol -> best ScanResult
     let mut symbol_scanners: HashMap<String, Vec<String>> = HashMap::new();
     let mut symbol_data: HashMap<String, ScanResult> = HashMap::new();
 
     for (i, &(code, _cid)) in scanners.iter().enumerate() {
-        let req_id = req_ids[i];
-        let results = client.get_scanner_results(req_id);
+        let sub = build_subscription(code, rows, min_price, max_price);
+        let mut subscription = match client.scanner_subscription(&sub, &vec![]).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(code, "failed to subscribe scanner: {e}");
+                continue;
+            }
+        };
+
+        let results: Vec<ScanResult> = match subscription.next().await {
+            Some(Ok(data)) => data.iter().map(|d| scanner_data_to_result(d)).collect(),
+            Some(Err(e)) => {
+                warn!(code, "scanner error: {e}");
+                vec![]
+            }
+            None => vec![],
+        };
+
+        subscription.cancel().await;
+
         let count = results.len();
         info!(scanner = i + 1, total = scanners.len(), code, count, "poll scanner results");
 
@@ -696,78 +179,26 @@ pub fn run_poll_scan(
         }
     }
 
-    // Cancel scanner subscriptions before requesting market data
-    for &req_id in &req_ids {
-        let _ = client.cancel_scanner_subscription(req_id);
-    }
-
-    // Rebuild contracts map with unique symbols for market data requests.
-    // Scanner processing used overlapping mkt_req_ids (all based on next_req_id=1000),
-    // so we reassign unique IDs for each symbol.
-    {
-        let mut s = client.state.lock().unwrap();
-        s.contracts.clear();
-        s.results.clear();
-        let mut mkt_id = 2000; // Use 2000+ to avoid collision with scanner req_ids
-        for (sym, data) in &symbol_data {
-            s.contracts.insert(mkt_id, (data.con_id, sym.clone(), data.currency.clone()));
-            s.results.insert(mkt_id, data.clone());
-            mkt_id += 1;
-        }
-    }
-
-    // Request delayed frozen data
-    if let Err(e) = client.req_market_data_type(4) {
-        warn!("Failed to set market data type: {e}");
-    }
-
-    // Request market data for all discovered symbols
-    if let Err(e) = client.request_market_data() {
-        warn!("Failed to request market data: {e}");
-    }
-
-    // Wait for tick data (3s for delayed frozen data)
-    std::thread::sleep(Duration::from_secs(3));
-
-    // Cancel market data
-    let _ = client.cancel_market_data();
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Merge market data back into symbol_data
-    let mkt_results = client.get_results();
-    for r in &mkt_results {
-        if let Some(entry) = symbol_data.get_mut(&r.symbol) {
-            if r.last.is_some() { entry.last = r.last; }
-            if r.change_pct.is_some() { entry.change_pct = r.change_pct; }
-            if r.change.is_some() { entry.change = r.change; }
-            if r.volume.is_some() { entry.volume = r.volume; }
-            if r.close.is_some() { entry.close = r.close; }
-        }
-    }
-
-    client.disconnect();
-
     (symbol_scanners, symbol_data, Some(port))
 }
 
 /// Fetch scanner parameters XML from TWS.
-pub fn fetch_scanner_params(host: &str, ports: &[u16], client_id: i32) -> Option<String> {
-    let mut client = TwsClient::connect(host, ports, client_id).ok()?;
+pub async fn fetch_scanner_params(host: &str, ports: &[u16], client_id: i32) -> Option<String> {
+    let (client, _port) = connect(host, ports, client_id).await.ok()?;
 
-    if client.req_scanner_parameters().is_err() {
-        client.disconnect();
-        return None;
+    match client.scanner_parameters().await {
+        Ok(xml) => Some(xml),
+        Err(e) => {
+            eprintln!("Failed to get scanner parameters: {e}");
+            None
+        }
     }
+}
 
-    if !client.wait_scanner_params(Duration::from_secs(15)) {
-        eprintln!("Timeout waiting for scanner parameters");
-        client.disconnect();
-        return None;
-    }
-
-    let xml = client.get_scanner_params_xml();
-    client.disconnect();
-    xml
+/// Probe TWS to find the first connectable port.
+pub async fn probe_port(host: &str, ports: &[u16]) -> Option<u16> {
+    let (_client, port) = connect(host, ports, 0).await.ok()?;
+    Some(port)
 }
 
 /// Parse scanner parameters XML and group by instrument -> category.
