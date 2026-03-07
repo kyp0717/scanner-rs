@@ -18,9 +18,9 @@ struct RailIcon {
 fn get_rail_icons() -> Vec<RailIcon> {
     vec![
         RailIcon {
-            view: View::Monitor,
+            view: View::Alerts,
             svg_bytes: ICON_MONITOR,
-            label: "Monitor",
+            label: "Alerts",
         },
         RailIcon {
             view: View::Scanner,

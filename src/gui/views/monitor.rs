@@ -5,7 +5,7 @@ use crate::gui::app::{App, Message};
 use crate::gui::theme::{self, Colors};
 
 impl App {
-    pub fn monitor_view(&self) -> Element<Message> {
+    pub fn alerts_view(&self) -> Element<Message> {
         let status = self.status_bar();
 
         let alert_table = self.alert_table_view();

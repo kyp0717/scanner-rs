@@ -86,7 +86,7 @@ src/
       side_rail.rs — 48px icon rail with SVG icons + tooltips
     views/
       mod.rs       — view module
-      monitor.rs   — alert table + detail panel (default view)
+      monitor.rs   — alerts view: alert table + detail panel (default view)
       scanner.rs   — command input + scan output
       log.rs       — combined log view (engine events + tws_scans, tagged by source)
       settings.rs  — settings + connection status

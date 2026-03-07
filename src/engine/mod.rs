@@ -247,12 +247,6 @@ impl AlertEngine {
                 info!(scanner = i + 1, total = ALERT_SCANNERS.len(), code, count, "scanner results");
             }
 
-            // Fetch market data snapshots for price/change/volume
-            if !symbol_data.is_empty() {
-                info!(symbols = symbol_data.len(), "fetching market data snapshots");
-                rt.block_on(tws::fetch_snapshots(&mut symbol_data, &host, &ports));
-            }
-
             let elapsed_secs = start.elapsed().as_secs_f64();
             info!(unique_stocks = symbol_data.len(), scanners_run, elapsed_secs, "poll scan complete");
 

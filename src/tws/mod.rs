@@ -122,14 +122,13 @@ pub async fn run_scan(
 
     subscription.cancel().await;
 
-    // Fetch market data snapshots for price/change/volume
+    // Fetch market data snapshots for price/change/volume (limit to 50)
     if !results.is_empty() {
         let mut data_map: HashMap<String, ScanResult> = results
             .into_iter()
             .map(|r| (r.symbol.clone(), r))
             .collect();
-        fetch_snapshots(&mut data_map, host, ports).await;
-        // Rebuild results preserving order by rank
+        fetch_snapshots(&mut data_map, host, ports, 50).await;
         results = data_map.into_values().collect();
         results.sort_by_key(|r| r.rank);
     }
@@ -199,10 +198,12 @@ pub async fn run_poll_scan(
 
 /// Fetch market data snapshots for a batch of scan results.
 /// Populates last, bid, ask, volume, close, and computes change_pct.
+/// Limited to `max_symbols` to avoid blocking too long; each symbol has a 3s timeout.
 pub async fn fetch_snapshots(
     results: &mut HashMap<String, ScanResult>,
     host: &str,
     ports: &[u16],
+    max_symbols: usize,
 ) {
     if results.is_empty() {
         return;
@@ -217,7 +218,7 @@ pub async fn fetch_snapshots(
         }
     };
 
-    let symbols: Vec<String> = results.keys().cloned().collect();
+    let symbols: Vec<String> = results.keys().take(max_symbols).cloned().collect();
     let mut fetched = 0usize;
 
     for sym in &symbols {
@@ -255,31 +256,38 @@ pub async fn fetch_snapshots(
         let mut bid = None;
         let mut ask = None;
 
-        // Drain ticks until SnapshotEnd or stream ends
-        while let Some(Ok(tick)) = subscription.next().await {
-            match tick {
-                TickTypes::SnapshotEnd => break,
-                TickTypes::Price(tp) => match tp.tick_type {
-                    TickType::Last => last = Some(tp.price),
-                    TickType::Close => close = Some(tp.price),
-                    TickType::Bid => bid = Some(tp.price),
-                    TickType::Ask => ask = Some(tp.price),
-                    _ => {}
-                },
-                TickTypes::PriceSize(tp) => match tp.price_tick_type {
-                    TickType::Last => last = Some(tp.price),
-                    TickType::Close => close = Some(tp.price),
-                    TickType::Bid => bid = Some(tp.price),
-                    TickType::Ask => ask = Some(tp.price),
-                    _ => {}
-                },
-                TickTypes::Size(ts) => {
-                    if ts.tick_type == TickType::Volume {
-                        volume = Some(ts.size as i64);
+        // Drain ticks until SnapshotEnd or 3s timeout
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, subscription.next()).await {
+                Ok(Some(Ok(tick))) => match tick {
+                    TickTypes::SnapshotEnd => break,
+                    TickTypes::Price(tp) => match tp.tick_type {
+                        TickType::Last => last = Some(tp.price),
+                        TickType::Close => close = Some(tp.price),
+                        TickType::Bid => bid = Some(tp.price),
+                        TickType::Ask => ask = Some(tp.price),
+                        _ => {}
+                    },
+                    TickTypes::PriceSize(tp) => match tp.price_tick_type {
+                        TickType::Last => last = Some(tp.price),
+                        TickType::Close => close = Some(tp.price),
+                        TickType::Bid => bid = Some(tp.price),
+                        TickType::Ask => ask = Some(tp.price),
+                        _ => {}
+                    },
+                    TickTypes::Size(ts) => {
+                        if ts.tick_type == TickType::Volume {
+                            volume = Some(ts.size as i64);
+                        }
                     }
+                    _ => {}
+                },
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => {
+                    debug!(symbol = %sym, "snapshot timeout");
+                    break;
                 }
-                TickTypes::Notice(_) => {}
-                _ => {}
             }
         }
 

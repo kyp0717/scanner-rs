@@ -18,7 +18,7 @@ use super::theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
-    Monitor,
+    Alerts,
     Scanner,
     Log,
     Settings,
@@ -74,7 +74,7 @@ impl App {
         let handle = rt.handle().clone();
         Self {
             engine,
-            view: View::Monitor,
+            view: View::Alerts,
             mode: Mode::Alert,
             output_lines: Vec::new(),
             alert_line: "No alerts".to_string(),
@@ -761,7 +761,7 @@ impl App {
     pub fn view(&self) -> Element<Message> {
         let rail = side_rail_view(self.view);
         let content = match self.view {
-            View::Monitor => self.monitor_view(),
+            View::Alerts => self.alerts_view(),
             View::Scanner => self.scanner_view(),
             View::Log => self.log_view(),
             View::Settings => self.settings_view(),
