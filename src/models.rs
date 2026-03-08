@@ -50,6 +50,7 @@ pub struct AlertRow {
     pub catalyst: Option<String>,
     pub catalyst_time: Option<i64>,
     pub scanner_hits: u32,
+    pub scanners: Vec<String>,
     pub news_headlines: Vec<NewsHeadline>,
     pub enriched: bool,
     pub avg_volume: Option<i64>,

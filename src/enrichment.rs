@@ -111,6 +111,77 @@ async fn fetch_yahoo_news(client: &Client, symbol: &str, auth: &YahooAuth) -> Re
     Ok(news)
 }
 
+/// Fetch recent news via Yahoo Finance RSS feed (no auth required, more reliable).
+async fn fetch_yahoo_news_rss(client: &Client, symbol: &str) -> Result<Vec<Value>> {
+    let url = format!(
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s={}&region=US&lang=en-US",
+        symbol
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await?
+        .error_for_status()?;
+    let body = resp.text().await?;
+
+    let mut reader = quick_xml::Reader::from_str(&body);
+    let mut items = Vec::new();
+    let mut in_item = false;
+    let mut in_title = false;
+    let mut in_pub_date = false;
+    let mut current_title = String::new();
+    let mut current_pub_date = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => match e.name().as_ref() {
+                b"item" => {
+                    in_item = true;
+                    current_title.clear();
+                    current_pub_date.clear();
+                }
+                b"title" if in_item => in_title = true,
+                b"pubDate" if in_item => in_pub_date = true,
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::End(e)) => match e.name().as_ref() {
+                b"item" => {
+                    if in_item && !current_title.is_empty() {
+                        let pub_time = chrono::DateTime::parse_from_rfc2822(&current_pub_date)
+                            .ok()
+                            .map(|dt| dt.timestamp());
+                        let mut item = serde_json::json!({"title": &current_title});
+                        if let Some(t) = pub_time {
+                            item["providerPublishTime"] = serde_json::json!(t);
+                        }
+                        items.push(item);
+                    }
+                    in_item = false;
+                }
+                b"title" => in_title = false,
+                b"pubDate" => in_pub_date = false,
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Text(e)) => {
+                if in_title {
+                    current_title = e.unescape().unwrap_or_default().to_string();
+                } else if in_pub_date {
+                    current_pub_date = e.unescape().unwrap_or_default().to_string();
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    items.truncate(5);
+    Ok(items)
+}
+
 /// Extract a nested field from Yahoo Finance quoteSummary response.
 fn extract_raw(data: &Value, module: &str, field: &str) -> Option<Value> {
     data.pointer(&format!(
@@ -149,8 +220,9 @@ pub async fn fetch_enrichment_with_auth(
 ) -> EnrichmentData {
     let mut data = EnrichmentData::default();
 
-    let (info_result, news_result) = tokio::join!(
+    let (info_result, rss_result, search_result) = tokio::join!(
         fetch_yahoo_info(client, symbol, auth),
+        fetch_yahoo_news_rss(client, symbol),
         fetch_yahoo_news(client, symbol, auth)
     );
 
@@ -168,22 +240,27 @@ pub async fn fetch_enrichment_with_auth(
         warn!("Yahoo Finance info fetch failed for {symbol}: {e}");
     }
 
-    if let Ok(news) = news_result {
-        if let Some((cat_title, cat_time)) = classify_catalyst(&news) {
-            data.catalyst = Some(cat_title);
-            data.catalyst_time = cat_time;
+    // Prefer RSS feed for news (more reliable), fall back to search API
+    let news = match rss_result {
+        Ok(rss) if !rss.is_empty() => rss,
+        _ => {
+            debug!("RSS news empty for {symbol}, trying search API");
+            search_result.unwrap_or_default()
         }
-        data.news_headlines = news
-            .iter()
-            .filter_map(|item| {
-                let title = item.get("title")?.as_str()?.to_string();
-                let published = item.get("providerPublishTime").and_then(|t| t.as_i64());
-                Some(NewsHeadline { title, published })
-            })
-            .collect();
-    } else if let Err(e) = news_result {
-        debug!("Yahoo Finance news fetch failed for {symbol}: {e}");
+    };
+
+    if let Some((cat_title, cat_time)) = classify_catalyst(&news) {
+        data.catalyst = Some(cat_title);
+        data.catalyst_time = cat_time;
     }
+    data.news_headlines = news
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            let published = item.get("providerPublishTime").and_then(|t| t.as_i64());
+            Some(NewsHeadline { title, published })
+        })
+        .collect();
 
     data
 }

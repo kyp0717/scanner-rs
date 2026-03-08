@@ -41,7 +41,7 @@ impl App {
                 .size(fs + 4)
                 .style(theme::text_color(Colors::CYAN)),
         );
-        lines = lines.push(Space::with_height(8));
+        lines = lines.push(Space::new().height(8));
 
         lines = lines.push(row![
             label!("Connection"),

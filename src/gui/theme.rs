@@ -26,6 +26,7 @@ pub fn scanner_theme() -> Theme {
             text: Colors::TEXT,
             primary: Colors::PRIMARY,
             success: Colors::GREEN,
+            warning: Colors::YELLOW,
             danger: Colors::RED,
         },
     )
@@ -103,5 +104,26 @@ pub fn text_color(color: Color) -> impl Fn(&Theme) -> text::Style {
 pub fn text_dim(_theme: &Theme) -> text::Style {
     text::Style {
         color: Some(Colors::TEXT_DIM),
+    }
+}
+
+pub fn category_btn_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color {
+            a: 0.3,
+            ..Colors::PRIMARY
+        },
+        button::Status::Pressed => Colors::PRIMARY,
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: Colors::TEXT,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
     }
 }

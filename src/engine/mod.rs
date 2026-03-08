@@ -373,6 +373,10 @@ impl AlertEngine {
                                 .unwrap_or(0);
                             let chg = r.change_pct.map(|c| format!("{c:+.1}%")).unwrap_or("-".into());
                             info!(symbol = %sym, hits, change = %chg, "new alert");
+                            let scanner_list = symbol_scanners
+                                .get(sym)
+                                .cloned()
+                                .unwrap_or_default();
                             self.alert_rows.push(AlertRow {
                                 symbol: sym.clone(),
                                 alert_time: now.clone(),
@@ -388,6 +392,7 @@ impl AlertEngine {
                                 catalyst: None,
                                 catalyst_time: None,
                                 scanner_hits: hits,
+                                scanners: scanner_list,
                                 news_headlines: Vec::new(),
                                 enriched: false,
                                 avg_volume: None,
@@ -410,13 +415,17 @@ impl AlertEngine {
                             if r.volume.is_some() {
                                 row.volume = r.volume;
                             }
-                            // Update scanner hits
-                            let hits = symbol_scanners
-                                .get(&row.symbol)
-                                .map(|s| s.len() as u32)
-                                .unwrap_or(row.scanner_hits);
-                            if hits > row.scanner_hits {
-                                row.scanner_hits = hits;
+                            // Update scanner hits and list
+                            if let Some(new_scanners) = symbol_scanners.get(&row.symbol) {
+                                for s in new_scanners {
+                                    if !row.scanners.contains(s) {
+                                        row.scanners.push(s.clone());
+                                    }
+                                }
+                                let hits = row.scanners.len() as u32;
+                                if hits > row.scanner_hits {
+                                    row.scanner_hits = hits;
+                                }
                             }
                         }
                     }
@@ -612,6 +621,7 @@ impl AlertEngine {
                         catalyst: s.catalyst.clone(),
                         catalyst_time: s.catalyst_time,
                         scanner_hits: n_scans,
+                        scanners: scanners_str.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
                         news_headlines,
                         enriched: enrichment_fresh,
                         avg_volume: s.avg_volume,
@@ -947,6 +957,7 @@ mod tests {
             catalyst: None,
             catalyst_time: None,
             scanner_hits: 3,
+            scanners: vec!["HOT_BY_VOLUME".into(), "TOP_PERC_GAIN".into(), "MOST_ACTIVE".into()],
             news_headlines: Vec::new(),
             enriched: false,
             avg_volume: None,

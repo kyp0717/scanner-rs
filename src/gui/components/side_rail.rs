@@ -8,6 +8,7 @@ const ICON_MONITOR: &[u8] = include_bytes!("../../../assets/icons/monitor.svg");
 const ICON_SEARCH: &[u8] = include_bytes!("../../../assets/icons/search.svg");
 const ICON_HISTORY: &[u8] = include_bytes!("../../../assets/icons/history.svg");
 const ICON_GEAR: &[u8] = include_bytes!("../../../assets/icons/gear.svg");
+const ICON_TEST: &[u8] = include_bytes!("../../../assets/icons/test.svg");
 
 struct RailIcon {
     view: View,
@@ -37,12 +38,17 @@ fn get_rail_icons() -> Vec<RailIcon> {
             svg_bytes: ICON_GEAR,
             label: "Settings",
         },
+        RailIcon {
+            view: View::Test,
+            svg_bytes: ICON_TEST,
+            label: "Test",
+        },
     ]
 }
 
-const RAIL_WIDTH: u16 = 48;
-const ICON_SIZE: u16 = 36;
-const SVG_SIZE: u16 = 20;
+const RAIL_WIDTH: u32 = 48;
+const ICON_SIZE: u32 = 36;
+const SVG_SIZE: u32 = 20;
 
 pub fn side_rail_view(current_view: View) -> Element<'static, Message> {
     let mut rail_buttons = column![]
@@ -86,7 +92,7 @@ pub fn side_rail_view(current_view: View) -> Element<'static, Message> {
         rail_buttons = rail_buttons.push(with_tooltip);
     }
 
-    container(column![rail_buttons, Space::with_height(Length::Fill)].width(RAIL_WIDTH))
+    container(column![rail_buttons, Space::new().height(Length::Fill)].width(RAIL_WIDTH))
         .height(Length::Fill)
         .style(rail_container_style)
         .into()

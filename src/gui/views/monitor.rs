@@ -8,8 +8,10 @@ impl App {
     pub fn alerts_view(&self) -> Element<Message> {
         let status = self.status_bar();
 
-        let alert_table = self.alert_table_view();
-        let detail = self.detail_panel_view();
+        let left_pct = self.alert_split as u16;
+        let right_pct = (100 - self.alert_split) as u16;
+        let alert_table = self.alert_table_view(left_pct);
+        let detail = self.detail_panel_view(right_pct);
 
         let main = row![alert_table, detail]
             .spacing(4)
@@ -24,30 +26,43 @@ impl App {
     }
 
     fn status_bar(&self) -> Element<Message> {
-        let port = self
-            .engine
-            .connected_port
-            .or(self.engine.settings.port)
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "auto".to_string());
-        let poll_str = if self.engine.polling { "on" } else { "off" };
-        let seen = self.engine.alert_seen.len();
+        let alerts_count = self.engine.alert_rows.len();
+        let alerts_text = text(format!("Alerts: {alerts_count}"))
+            .size(self.font_size + 1)
+            .style(theme::text_color(Colors::CYAN));
 
-        let status_text = text(format!(
-            "Scanner -- {}:{}  |  Polling: {}  |  Seen: {}",
-            self.engine.settings.host, port, poll_str, seen
-        ))
-        .size(self.font_size + 1)
-        .style(theme::text_dim);
+        let poll_text = if self.engine.polling {
+            let elapsed = self.last_poll.elapsed().as_secs();
+            let remaining = 15u64.saturating_sub(elapsed);
+            if self.engine.bg_busy {
+                text("Scanning...".to_string())
+                    .size(self.font_size + 1)
+                    .style(theme::text_color(Colors::YELLOW))
+            } else {
+                text(format!("Next scan: {remaining}s"))
+                    .size(self.font_size + 1)
+                    .style(theme::text_dim)
+            }
+        } else {
+            text("Polling: off".to_string())
+                .size(self.font_size + 1)
+                .style(theme::text_dim)
+        };
 
-        container(status_text)
+        let bar = row![
+            alerts_text,
+            Space::new().width(Length::Fill),
+            poll_text,
+        ]
+        .padding([4, 8]);
+
+        container(bar)
             .width(Length::Fill)
-            .padding([4, 8])
             .style(theme::status_bar)
             .into()
     }
 
-    fn alert_table_view(&self) -> Element<Message> {
+    fn alert_table_view(&self, pct: u16) -> Element<Message> {
         let fs = self.font_size;
         let header = row![
             text("Time")
@@ -140,14 +155,14 @@ impl App {
         }
 
         container(scrollable(rows_col).height(Length::Fill))
-            .width(Length::FillPortion(1))
+            .width(Length::FillPortion(pct))
             .height(Length::Fill)
             .padding(4)
             .style(theme::card_container)
             .into()
     }
 
-    fn detail_panel_view(&self) -> Element<Message> {
+    fn detail_panel_view(&self, pct: u16) -> Element<Message> {
         let fs = self.font_size;
         let mut lines = column![].spacing(4).padding(8);
 
@@ -156,7 +171,7 @@ impl App {
         {
             lines = lines.push(text("No stock selected").size(fs + 1).style(theme::text_dim));
             return container(lines)
-                .width(Length::FillPortion(1))
+                .width(Length::FillPortion(pct))
                 .height(Length::Fill)
                 .style(theme::card_container)
                 .into();
@@ -169,7 +184,7 @@ impl App {
                 .size(fs + 6)
                 .style(theme::text_color(Colors::CYAN)),
         );
-        lines = lines.push(Space::with_height(4));
+        lines = lines.push(Space::new().height(4));
 
         macro_rules! label {
             ($s:expr) => {
@@ -237,7 +252,7 @@ impl App {
             fmt_or_dots(r.enriched, r.short_pct.map(|v| format!("{:.1}%", v * 100.0)));
         lines = lines.push(row![label!("Short%"), val!(short_str)]);
 
-        lines = lines.push(Space::with_height(4));
+        lines = lines.push(Space::new().height(4));
 
         // Name, Sector, Industry
         let name_str = fmt_or_dots(r.enriched, r.name.clone());
@@ -249,76 +264,63 @@ impl App {
         let industry_str = fmt_or_dots(r.enriched, r.industry.clone());
         lines = lines.push(row![label!("Industry"), val!(industry_str)]);
 
-        lines = lines.push(Space::with_height(4));
+        lines = lines.push(Space::new().height(4));
 
         // Scanner Hits
         lines = lines.push(row![
             label!("Scanners"),
             val!(format!("{}/8", r.scanner_hits))
         ]);
-
-        // Catalyst
-        let catalyst_display = r.catalyst.as_ref().map(|cat| {
-            let ago = r.catalyst_time.map(|epoch| {
-                let now = chrono::Utc::now().timestamp();
-                let diff = now - epoch;
-                if diff < 60 {
-                    "now".to_string()
-                } else if diff < 3600 {
-                    format!("{}m ago", diff / 60)
-                } else if diff < 86400 {
-                    format!("{}h ago", diff / 3600)
-                } else {
-                    format!("{}d ago", diff / 86400)
-                }
-            });
-            match ago {
-                Some(a) => format!("{cat} ({a})"),
-                None => cat.clone(),
+        if !r.scanners.is_empty() {
+            let scan_size = if fs > 9 { fs - 1 } else { fs };
+            for s in &r.scanners {
+                lines = lines.push(
+                    text(format!("  {s}"))
+                        .size(scan_size)
+                        .style(theme::text_dim),
+                );
             }
-        });
-        let cat_str = fmt_or_dots(r.enriched, catalyst_display);
-        lines = lines.push(row![label!("Catalyst"), val!(cat_str)]);
+        }
 
         // News Headlines
         if !r.news_headlines.is_empty() {
-            lines = lines.push(Space::with_height(4));
+            lines = lines.push(Space::new().height(4));
             lines = lines.push(
                 text("News")
                     .size(fs)
                     .style(theme::text_color(Colors::YELLOW)),
             );
             let news_size = if fs > 9 { fs - 1 } else { fs };
-            for (i, headline) in r.news_headlines.iter().take(5).enumerate() {
-                let ago = headline
-                    .published
-                    .map(|epoch| {
-                        let now = chrono::Utc::now().timestamp();
-                        let diff = now - epoch;
-                        if diff < 60 {
-                            "now".to_string()
-                        } else if diff < 3600 {
-                            format!("{}m", diff / 60)
-                        } else if diff < 86400 {
-                            format!("{}h", diff / 3600)
-                        } else {
-                            format!("{}d", diff / 86400)
-                        }
-                    })
-                    .unwrap_or_default();
-                let prefix = if ago.is_empty() {
-                    format!(" {}. ", i + 1)
-                } else {
-                    format!(" {}. {} ", i + 1, ago)
-                };
-                let title = &headline.title;
-                let max_title = 50usize.saturating_sub(prefix.len());
-                let truncated = if title.len() > max_title {
-                    format!("{}...", &title[..max_title.saturating_sub(3)])
-                } else {
-                    title.clone()
-                };
-                lines = lines.push(text(format!("{prefix}{truncated}")).size(news_size));
+            let now_ts = chrono::Utc::now().timestamp();
+            let five_days = 5 * 86400;
+            for headline in r.news_headlines.iter()
+                .filter(|h| h.published.map_or(true, |ep| now_ts - ep < five_days))
+                .take(5)
+            {
+                if let Some(epoch) = headline.published {
+                    let dt = chrono::DateTime::from_timestamp(epoch, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Local);
+                    let diff = now_ts - epoch;
+                    let ago = if diff < 60 {
+                        "now".to_string()
+                    } else if diff < 3600 {
+                        format!("{}m ago", diff / 60)
+                    } else if diff < 86400 {
+                        format!("{}h ago", diff / 3600)
+                    } else {
+                        format!("{}d ago", diff / 86400)
+                    };
+                    lines = lines.push(
+                        text(format!("  {} ({})", dt.format("%b %d %H:%M"), ago))
+                            .size(if news_size > 2 { news_size - 2 } else { news_size })
+                            .style(theme::text_dim),
+                    );
+                }
+                lines = lines.push(
+                    text(format!("  {}", headline.title))
+                        .size(news_size),
+                );
             }
         } else if !r.enriched {
             lines = lines.push(row![
@@ -331,7 +333,7 @@ impl App {
         }
 
         container(scrollable(lines).height(Length::Fill))
-            .width(Length::FillPortion(1))
+            .width(Length::FillPortion(pct))
             .height(Length::Fill)
             .style(theme::card_container)
             .into()

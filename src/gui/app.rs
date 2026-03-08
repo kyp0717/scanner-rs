@@ -22,6 +22,7 @@ pub enum View {
     Scanner,
     Log,
     Settings,
+    Test,
 }
 
 /// Application mode (kept for test compatibility).
@@ -42,6 +43,9 @@ pub enum Message {
     SelectAlert(usize),
     IncreaseFontSize,
     DecreaseFontSize,
+    SplitLeft,
+    SplitRight,
+    ScanCategory(String),
     FontLoaded(Result<(), iced::font::Error>),
 }
 
@@ -62,10 +66,12 @@ pub struct App {
     pub scroll_offset: u16,
     pub log_lines: Vec<String>,
     pub log_scroll: u16,
-    pub font_size: u16,
+    pub font_size: u32,
+    pub alert_split: u32, // left panel percentage (10-90)
     pub rt_handle: tokio::runtime::Handle,
     _runtime: tokio::runtime::Runtime,
     pub last_poll: std::time::Instant,
+    pub scanner_show_alerts: bool,
 }
 
 impl App {
@@ -88,10 +94,12 @@ impl App {
             scroll_offset: 0,
             log_lines: Vec::new(),
             log_scroll: 0,
-            font_size: 12,
+            font_size: 18,
+            alert_split: 55,
             rt_handle: handle,
             _runtime: rt,
             last_poll: std::time::Instant::now(),
+            scanner_show_alerts: true,
         }
     }
 
@@ -743,7 +751,7 @@ impl App {
                 }
 
                 if self.should_quit {
-                    return iced::window::get_latest()
+                    return iced::window::latest()
                         .and_then(iced::window::close);
                 }
             }
@@ -773,6 +781,26 @@ impl App {
                     self.font_size -= 1;
                 }
             }
+            Message::SplitLeft => {
+                if self.alert_split > 20 {
+                    self.alert_split -= 5;
+                }
+            }
+            Message::SplitRight => {
+                if self.alert_split < 80 {
+                    self.alert_split += 5;
+                }
+            }
+            Message::ScanCategory(category) => {
+                self.view = View::Scanner;
+                if category == "__alert__" {
+                    self.scanner_show_alerts = true;
+                } else {
+                    self.scanner_show_alerts = false;
+                    let handle = self.rt_handle.clone();
+                    self.handle_input(&format!("list {category}"), &handle);
+                }
+            }
             Message::FontLoaded(_) => {}
         }
         Task::none()
@@ -785,6 +813,7 @@ impl App {
             View::Scanner => self.scanner_view(),
             View::Log => self.log_view(),
             View::Settings => self.settings_view(),
+            View::Test => self.test_view(),
         };
 
         let main = container(content)
@@ -797,17 +826,25 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let tick = iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick);
 
-        let kbd = keyboard::on_key_press(|key, modifiers| {
-            if modifiers.control() {
-                return match key.as_ref() {
-                    keyboard::Key::Character("=") | keyboard::Key::Character("+") => {
-                        Some(Message::IncreaseFontSize)
-                    }
-                    keyboard::Key::Character("-") => Some(Message::DecreaseFontSize),
-                    _ => None,
-                };
+        let kbd = keyboard::listen().map(|event| {
+            if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
+                if modifiers.control() {
+                    return match key.as_ref() {
+                        keyboard::Key::Character("=") | keyboard::Key::Character("+") => {
+                            Message::IncreaseFontSize
+                        }
+                        keyboard::Key::Character("-") => Message::DecreaseFontSize,
+                        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                            Message::SplitLeft
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                            Message::SplitRight
+                        }
+                        _ => Message::Tick,
+                    };
+                }
             }
-            None
+            Message::Tick
         });
 
         Subscription::batch(vec![tick, kbd])
@@ -816,12 +853,13 @@ impl App {
 
 /// Launch the iced GUI application.
 pub fn run_gui(host: String, port: Option<u16>) -> iced::Result {
-    iced::application(App::iced_title, App::update, App::view)
+    iced::application(move || App::new_gui(host.clone(), port), App::update, App::view)
+        .title(App::iced_title)
         .subscription(App::subscription)
         .theme(App::iced_theme)
         .default_font(Font::MONOSPACE)
         .window_size((1400.0, 900.0))
-        .run_with(move || App::new_gui(host, port))
+        .run()
 }
 
 #[cfg(test)]

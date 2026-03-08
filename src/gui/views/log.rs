@@ -37,7 +37,7 @@ impl App {
             }
         }
 
-        container(scrollable(lines).height(Length::Fill))
+        container(scrollable(lines.width(Length::Fill)).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(4)
