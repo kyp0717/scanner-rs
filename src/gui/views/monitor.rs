@@ -49,8 +49,20 @@ impl App {
                 .style(theme::text_dim)
         };
 
+        let tws_text = if self.engine.connected_port.is_some() {
+            text("TWS: connected".to_string())
+                .size(self.font_size + 1)
+                .style(theme::text_color(Colors::GREEN))
+        } else {
+            text("TWS: disconnected".to_string())
+                .size(self.font_size + 1)
+                .style(theme::text_color(Colors::RED))
+        };
+
         let bar = row![
             alerts_text,
+            Space::new().width(20),
+            tws_text,
             Space::new().width(Length::Fill),
             poll_text,
         ]
