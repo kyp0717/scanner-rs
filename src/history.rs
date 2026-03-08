@@ -50,7 +50,11 @@ impl SupabaseClient {
             req = req.header(k, v);
         }
         let resp = req.send().await.context("Supabase SELECT failed")?;
-        let data: Vec<Value> = resp.json().await.context("Supabase response parse failed")?;
+        let text = resp.text().await.context("Supabase response read failed")?;
+        let data: Vec<Value> = serde_json::from_str(&text).context(format!(
+            "Supabase response parse failed: {}",
+            if text.len() > 200 { &text[..200] } else { &text }
+        ))?;
         Ok(data)
     }
 

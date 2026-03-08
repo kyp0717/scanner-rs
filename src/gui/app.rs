@@ -46,6 +46,7 @@ pub enum Message {
     SplitLeft,
     SplitRight,
     ScanCategory(String),
+    RunScan(String),
     FontLoaded(Result<(), iced::font::Error>),
 }
 
@@ -71,7 +72,7 @@ pub struct App {
     pub rt_handle: tokio::runtime::Handle,
     _runtime: tokio::runtime::Runtime,
     pub last_poll: std::time::Instant,
-    pub scanner_show_alerts: bool,
+    pub scanner_selected: Option<String>,
 }
 
 impl App {
@@ -99,7 +100,7 @@ impl App {
             rt_handle: handle,
             _runtime: rt,
             last_poll: std::time::Instant::now(),
-            scanner_show_alerts: true,
+            scanner_selected: Some("__alert__".to_string()),
         }
     }
 
@@ -793,13 +794,21 @@ impl App {
             }
             Message::ScanCategory(category) => {
                 self.view = View::Scanner;
-                if category == "__alert__" {
-                    self.scanner_show_alerts = true;
-                } else {
-                    self.scanner_show_alerts = false;
+                self.scanner_selected = Some(category.clone());
+                // For categories without known scanner info table, fetch from TWS
+                let has_table = matches!(
+                    category.as_str(),
+                    "__alert__" | "__momentum__" | "__premarket_gaps__" | "__extended_hours__" | "__highs__"
+                );
+                if !has_table {
                     let handle = self.rt_handle.clone();
                     self.handle_input(&format!("list {category}"), &handle);
                 }
+            }
+            Message::RunScan(code) => {
+                self.scanner_selected = Some("__results__".to_string());
+                let handle = self.rt_handle.clone();
+                self.handle_input(&format!("scan {code}"), &handle);
             }
             Message::FontLoaded(_) => {}
         }

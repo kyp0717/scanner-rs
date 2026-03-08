@@ -50,6 +50,7 @@ fn scanner_data_to_result(data: &ibapi::scanner::ScannerData) -> ScanResult {
 }
 
 /// Try connecting to TWS on the given ports, return the first successful client and port.
+/// Each port attempt has a 3-second timeout to avoid hanging when TWS is not running.
 async fn connect(
     host: &str,
     ports: &[u16],
@@ -59,14 +60,23 @@ async fn connect(
 
     for &port in ports {
         let addr = format!("{host}:{port}");
-        match ibapi::Client::connect(&addr, client_id).await {
-            Ok(client) => {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ibapi::Client::connect(&addr, client_id),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
                 info!("Connected to TWS on port {port}");
                 eprintln!("Connected to TWS on port {port}");
                 return Ok((client, port));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!("Connection failed on port {port}: {e}");
+                continue;
+            }
+            Err(_) => {
+                debug!("Connection timed out on port {port}");
                 continue;
             }
         }

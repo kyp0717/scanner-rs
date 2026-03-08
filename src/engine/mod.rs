@@ -566,7 +566,12 @@ impl AlertEngine {
     /// Returns (loaded_count, needs_enrichment_count).
     pub fn init_from_tws_scans(&mut self, rt: &tokio::runtime::Handle) -> (usize, usize) {
         if let Some(ref db) = self.db {
-            if let Ok(today) = rt.block_on(db.get_today()) {
+            let result = rt.block_on(db.get_today());
+            if let Err(ref e) = result {
+                warn!("Failed to load today's scans from Supabase: {e}");
+                eprintln!("Supabase error: {e}");
+            }
+            if let Ok(today) = result {
                 let loaded = today.len();
                 let mut needs_enrich = 0usize;
                 for s in &today {

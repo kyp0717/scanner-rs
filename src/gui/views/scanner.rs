@@ -1,52 +1,53 @@
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, table, text, Space};
 use iced::{Element, Length};
 
 use crate::gui::app::{App, Message};
 use crate::gui::theme::{self, Colors};
 
 /// Scanner categories for the sidebar.
-const SCANNER_CATEGORIES: &[(&str, &[(&str, &str)])] = &[
+const SCANNER_CATEGORIES: &[(&str, &str, &[(&str, &str)])] = &[
     (
-        "Momentum & Gainers",
-        &[
-            ("TOP_PERC_GAIN", "Top % Gainers"),
-            ("TOP_PERC_LOSE", "Top % Losers"),
-        ],
+        "__alert__",
+        "Alerts (8)",
+        &[],
     ),
     (
-        "Volume & Activity",
-        &[
-            ("HOT_BY_VOLUME", "Hot by Volume"),
-            ("MOST_ACTIVE", "Most Active"),
-            ("TOP_TRADE_COUNT", "Top Trade Count"),
-            ("HOT_BY_PRICE", "Hot by Price"),
-            ("TOP_VOLUME_RATE", "Top Volume Rate"),
-        ],
+        "__momentum__",
+        "Momentum (7)",
+        &[],
     ),
     (
-        "Gaps & Extended Hours",
-        &[
-            ("HIGH_OPEN_GAP", "Gap Up"),
-            ("LOW_OPEN_GAP", "Gap Down"),
-        ],
+        "__premarket_gaps__",
+        "Premarket Gaps (2)",
+        &[],
     ),
     (
-        "Highs & Lows",
-        &[("HIGH_VS_52W_HL", "52-Week High/Low")],
+        "__extended_hours__",
+        "Extended Hours (3)",
+        &[],
     ),
     (
+        "__highs__",
+        "Highs & Lows (1)",
+        &[],
+    ),
+    (
+        "Short Interest",
         "Short Interest",
         &[],
     ),
     (
         "Technical Indicators",
+        "Technical Indicators",
         &[],
     ),
     (
         "Social Sentiment",
+        "Social Sentiment",
         &[],
     ),
     (
+        "Dividends",
         "Dividends",
         &[],
     ),
@@ -113,11 +114,106 @@ const ALERT_SCANNERS_INFO: &[(&str, &str)] = &[
     ),
 ];
 
+/// Momentum scanners (combined Momentum & Gainers + Volume & Activity).
+const MOMENTUM_SCANNERS_INFO: &[(&str, &str)] = &[
+    (
+        "TOP_PERC_GAIN",
+        "Biggest percentage gainers on the day. The primary scanner for finding \
+         momentum plays — stocks up 10%, 20%, or more on earnings, FDA, contracts, \
+         or short squeezes.",
+    ),
+    (
+        "TOP_PERC_LOSE",
+        "Biggest percentage losers on the day. Mirror of TOP_PERC_GAIN for the \
+         downside — useful for short setups, fade plays, or tracking sector weakness.",
+    ),
+    (
+        "HOT_BY_VOLUME",
+        "Highest volume relative to recent average. Flags unusual trading activity \
+         that precedes large moves — institutional buying, news reaction, or momentum \
+         traders piling in.",
+    ),
+    (
+        "MOST_ACTIVE",
+        "Highest absolute share volume traded. Shows raw liquidity — millions of \
+         shares changing hands. Tight spreads, easy fills, heavy market attention. \
+         Confirms a move has real participation.",
+    ),
+    (
+        "TOP_TRADE_COUNT",
+        "Most individual trades (not volume). Broad retail and institutional \
+         participation. Many small trades indicate retail interest and social media \
+         buzz — catches meme stocks and crowd-driven momentum.",
+    ),
+    (
+        "HOT_BY_PRICE",
+        "Most rapid price movement in a short window. Detects fast, explosive moves \
+         happening in seconds to minutes — breaking news or technical breakouts. \
+         Ideal for scalpers and intraday momentum traders.",
+    ),
+    (
+        "TOP_VOLUME_RATE",
+        "Fastest volume acceleration compared to recent bars. Measures the speed of \
+         the current surge — a stock going from 10K to 500K shares/min ranks high. \
+         Catches the earliest stage of a volume breakout.",
+    ),
+];
+
+/// Premarket gap scanners.
+const PREMARKET_GAPS_INFO: &[(&str, &str)] = &[
+    (
+        "HIGH_OPEN_GAP",
+        "Stocks gapping up significantly from the previous close at the open. \
+         Gap-ups signal overnight news, pre-market buying pressure, or earnings \
+         surprises. Watch for gap-and-go continuation or gap-fade reversals.",
+    ),
+    (
+        "LOW_OPEN_GAP",
+        "Stocks gapping down significantly from the previous close at the open. \
+         Gap-downs signal negative news, after-hours selling, or missed expectations. \
+         Watch for bounce plays or continued breakdown.",
+    ),
+];
+
+/// Extended hours (after-hours / pre-market) scanners.
+const EXTENDED_HOURS_INFO: &[(&str, &str)] = &[
+    (
+        "AFTER_HOURS_PERC_GAIN",
+        "Top percentage gainers in after-hours / pre-market trading. Catches \
+         stocks reacting to earnings releases, FDA decisions, or other news \
+         announced outside regular trading hours.",
+    ),
+    (
+        "AFTER_HOURS_PERC_LOSE",
+        "Top percentage losers in after-hours / pre-market trading. Flags \
+         stocks dropping on missed earnings, downgrades, or negative news \
+         released outside regular hours.",
+    ),
+    (
+        "AFTER_HOURS_VOLUME",
+        "Highest volume in after-hours / pre-market sessions. Shows which \
+         stocks have the most trading activity outside RTH — often the \
+         earliest signal of a catalyst before the regular session opens.",
+    ),
+];
+
+/// Highs & Lows scanners.
+const HIGHS_SCANNERS_INFO: &[(&str, &str)] = &[
+    (
+        "HIGH_VS_52W_HL",
+        "Stocks trading at or near their 52-week high. No overhead resistance — \
+         every holder is profitable. Momentum traders buy breakouts to new highs \
+         expecting continuation. Combined with volume, one of the strongest \
+         technical signals for sustained upward movement.",
+    ),
+];
+
+
 impl App {
     pub fn scanner_view(&self) -> Element<Message> {
         let fs = self.font_size;
 
-        // Sidebar: alert scanners button + scanner categories
+        // Sidebar
         let mut sidebar = column![
             text("Categories")
                 .size(fs + 2)
@@ -127,37 +223,22 @@ impl App {
         .spacing(2)
         .padding(8);
 
-        // Alert Scanners button at the top
-        let alert_btn = button(
-            text("Alert Scanners (8)")
-                .size(fs)
-                .style(theme::text_color(Colors::GREEN)),
-        )
-        .on_press(Message::ScanCategory("__alert__".to_string()))
-        .padding([4, 8])
-        .width(Length::Fill)
-        .style(theme::category_btn_style);
-
-        sidebar = sidebar.push(alert_btn);
-        sidebar = sidebar.push(Space::new().height(4));
-
-        for &(category, scanners) in SCANNER_CATEGORIES {
-            let count = scanners.len();
-            let label = if count > 0 {
-                format!("{category} ({count})")
+        for &(key, label, _) in SCANNER_CATEGORIES {
+            let has_scanners = matches!(
+                key,
+                "__alert__" | "__momentum__" | "__premarket_gaps__" | "__extended_hours__" | "__highs__"
+            );
+            let color = if key == "__alert__" {
+                Colors::GREEN
+            } else if has_scanners {
+                Colors::TEXT
             } else {
-                category.to_string()
+                Colors::TEXT_DIM
             };
             let btn = button(
-                text(label)
-                    .size(fs)
-                    .style(theme::text_color(if count > 0 {
-                        Colors::TEXT
-                    } else {
-                        Colors::TEXT_DIM
-                    })),
+                text(label).size(fs).style(theme::text_color(color)),
             )
-            .on_press(Message::ScanCategory(category.to_string()))
+            .on_press(Message::ScanCategory(key.to_string()))
             .padding([4, 8])
             .width(Length::Fill)
             .style(theme::category_btn_style);
@@ -170,11 +251,40 @@ impl App {
             .height(Length::Fill)
             .style(theme::card_container);
 
-        // Right panel: scanner details or category output
-        let right_panel = if self.scanner_show_alerts {
-            self.alert_scanners_panel(fs)
-        } else {
-            self.category_output_panel(fs)
+        // Right panel
+        let selected_key = self.scanner_selected.as_deref().unwrap_or("__alert__");
+        let right_panel = match selected_key {
+            "__alert__" => self.scanner_table_panel(
+                fs,
+                "Alerts",
+                "These 8 scanners run every poll cycle to detect momentum stocks.",
+                ALERT_SCANNERS_INFO,
+            ),
+            "__momentum__" => self.scanner_table_panel(
+                fs,
+                "Momentum",
+                "Gainers, losers, volume, and price action scanners.",
+                MOMENTUM_SCANNERS_INFO,
+            ),
+            "__premarket_gaps__" => self.scanner_table_panel(
+                fs,
+                "Premarket Gaps",
+                "Stocks gapping up or down from previous close at the open.",
+                PREMARKET_GAPS_INFO,
+            ),
+            "__extended_hours__" => self.scanner_table_panel(
+                fs,
+                "Extended Hours",
+                "After-hours and pre-market scanners for outside RTH activity.",
+                EXTENDED_HOURS_INFO,
+            ),
+            "__highs__" => self.scanner_table_panel(
+                fs,
+                "Highs & Lows",
+                "52-week high and low breakout scanners.",
+                HIGHS_SCANNERS_INFO,
+            ),
+            _ => self.category_output_panel(fs),
         };
 
         row![sidebar_panel, right_panel]
@@ -185,36 +295,65 @@ impl App {
             .into()
     }
 
-    fn alert_scanners_panel(&self, fs: u32) -> Element<Message> {
-        let mut content = column![
-            text("Alert Scanners")
+    fn scanner_table_panel(
+        &self,
+        fs: u32,
+        title: &'static str,
+        subtitle: &'static str,
+        scanners: &'static [(&'static str, &'static str)],
+    ) -> Element<Message> {
+        let desc_size = if fs > 3 { fs - 3 } else { fs };
+
+        let code_col = table::column(
+            text("Scanner Code")
+                .size(fs)
+                .style(theme::text_color(Colors::YELLOW)),
+            move |r: (&str, &str)| -> Element<Message> {
+                button(
+                    text(r.0)
+                        .size(fs)
+                        .style(theme::text_color(Colors::GREEN)),
+                )
+                .on_press(Message::RunScan(r.0.to_string()))
+                .padding([2, 4])
+                .style(theme::category_btn_style)
+                .into()
+            },
+        )
+        .width(Length::FillPortion(2));
+
+        let desc_col = table::column(
+            text("Description")
+                .size(fs)
+                .style(theme::text_color(Colors::YELLOW)),
+            move |r: (&str, &str)| -> Element<Message> {
+                text(r.1)
+                    .size(desc_size)
+                    .style(theme::text_dim)
+                    .into()
+            },
+        )
+        .width(Length::FillPortion(5));
+
+        let tbl = table::table([code_col, desc_col], scanners.to_vec())
+            .padding(8)
+            .separator(1);
+
+        let content = column![
+            text(title)
                 .size(fs + 2)
                 .style(theme::text_color(Colors::CYAN)),
-            text("These 8 scanners run every poll cycle to detect momentum stocks.")
+            text(subtitle)
                 .size(if fs > 3 { fs - 2 } else { fs })
                 .style(theme::text_dim),
             Space::new().height(8),
+            tbl,
         ]
         .spacing(4)
-        .padding(8);
+        .padding(8)
+        .width(Length::Fill);
 
-        let desc_size = if fs > 3 { fs - 3 } else { fs };
-
-        for &(code, description) in ALERT_SCANNERS_INFO {
-            content = content.push(
-                text(code)
-                    .size(fs)
-                    .style(theme::text_color(Colors::GREEN)),
-            );
-            content = content.push(
-                text(description)
-                    .size(desc_size)
-                    .style(theme::text_dim),
-            );
-            content = content.push(Space::new().height(6));
-        }
-
-        container(scrollable(content.width(Length::Fill)).height(Length::Fill))
+        container(content)
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(4)
@@ -227,7 +366,7 @@ impl App {
 
         if self.output_lines.is_empty() {
             output = output.push(
-                text("Select a category or click Alert Scanners")
+                text("Select a category")
                     .size(fs)
                     .style(theme::text_dim),
             );
