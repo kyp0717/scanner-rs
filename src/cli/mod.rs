@@ -319,7 +319,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
                         }
                     }
                 }
-                EngineEvent::EnrichComplete { ref symbol } => {
+                EngineEvent::EnrichComplete { ref symbol, .. } => {
                     if let Some(row) =
                         engine.alert_rows.iter().find(|r| r.symbol == *symbol)
                     {

@@ -203,7 +203,10 @@ pub async fn run_poll_scan(
         }
     }
 
-    // No snapshots here — streaming market data thread handles live prices
+    // Fetch snapshots for initial prices (streaming updates them later)
+    if !symbol_data.is_empty() {
+        fetch_snapshots(&mut symbol_data, host, ports, 50).await;
+    }
 
     (symbol_scanners, symbol_data, Some(port))
 }

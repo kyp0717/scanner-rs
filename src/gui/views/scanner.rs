@@ -253,38 +253,47 @@ impl App {
 
         // Right panel
         let selected_key = self.scanner_selected.as_deref().unwrap_or("__alert__");
-        let right_panel = match selected_key {
-            "__alert__" => self.scanner_table_panel(
-                fs,
-                "Alerts",
-                "These 8 scanners run every poll cycle to detect momentum stocks.",
-                ALERT_SCANNERS_INFO,
-            ),
-            "__momentum__" => self.scanner_table_panel(
-                fs,
-                "Momentum",
-                "Gainers, losers, volume, and price action scanners.",
-                MOMENTUM_SCANNERS_INFO,
-            ),
-            "__premarket_gaps__" => self.scanner_table_panel(
-                fs,
-                "Premarket Gaps",
-                "Stocks gapping up or down from previous close at the open.",
-                PREMARKET_GAPS_INFO,
-            ),
-            "__extended_hours__" => self.scanner_table_panel(
-                fs,
-                "Extended Hours",
-                "After-hours and pre-market scanners for outside RTH activity.",
-                EXTENDED_HOURS_INFO,
-            ),
-            "__highs__" => self.scanner_table_panel(
-                fs,
-                "Highs & Lows",
-                "52-week high and low breakout scanners.",
-                HIGHS_SCANNERS_INFO,
-            ),
-            _ => self.category_output_panel(fs),
+
+        // If we have scan results and we're on the results view, show split panel
+        let right_panel = if selected_key == "__results__" && !self.scan_results.is_empty() {
+            self.scan_results_split_panel(fs)
+        } else if selected_key == "__results__" {
+            // Results view but no results (or cleared)
+            self.category_output_panel(fs)
+        } else {
+            match selected_key {
+                "__alert__" => self.scanner_table_panel(
+                    fs,
+                    "Alerts",
+                    "These 8 scanners run every poll cycle to detect momentum stocks.",
+                    ALERT_SCANNERS_INFO,
+                ),
+                "__momentum__" => self.scanner_table_panel(
+                    fs,
+                    "Momentum",
+                    "Gainers, losers, volume, and price action scanners.",
+                    MOMENTUM_SCANNERS_INFO,
+                ),
+                "__premarket_gaps__" => self.scanner_table_panel(
+                    fs,
+                    "Premarket Gaps",
+                    "Stocks gapping up or down from previous close at the open.",
+                    PREMARKET_GAPS_INFO,
+                ),
+                "__extended_hours__" => self.scanner_table_panel(
+                    fs,
+                    "Extended Hours",
+                    "After-hours and pre-market scanners for outside RTH activity.",
+                    EXTENDED_HOURS_INFO,
+                ),
+                "__highs__" => self.scanner_table_panel(
+                    fs,
+                    "Highs & Lows",
+                    "52-week high and low breakout scanners.",
+                    HIGHS_SCANNERS_INFO,
+                ),
+                _ => self.category_output_panel(fs),
+            }
         };
 
         row![sidebar_panel, right_panel]
@@ -292,6 +301,268 @@ impl App {
             .padding(4)
             .width(Length::Fill)
             .height(Length::Fill)
+            .into()
+    }
+
+    /// Split panel showing scan results table (left) + detail panel (right).
+    fn scan_results_split_panel(&self, fs: u32) -> Element<Message> {
+        let left_pct = self.alert_split as u16;
+        let right_pct = (100 - self.alert_split) as u16;
+
+        let results_table = self.scan_results_table_view(fs, left_pct);
+        let detail = self.scan_result_detail_view(fs, right_pct);
+
+        let status = {
+            let count = self.scan_results.len();
+            let status_text = text(format!("{} — {} results", self.scan_results_code, count))
+                .size(fs + 1)
+                .style(theme::text_color(Colors::CYAN));
+
+            let bar = row![
+                status_text,
+                Space::new().width(Length::Fill),
+            ]
+            .padding([4, 8]);
+
+            container(bar)
+                .width(Length::Fill)
+                .style(theme::status_bar)
+        };
+
+        let main = row![results_table, detail]
+            .spacing(4)
+            .height(Length::Fill);
+
+        column![status, main]
+            .spacing(4)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Table of scan results (left side of split).
+    fn scan_results_table_view(&self, fs: u32, pct: u16) -> Element<Message> {
+        let header = row![
+            text("#")
+                .size(fs)
+                .width(Length::FillPortion(1))
+                .style(theme::text_color(Colors::YELLOW)),
+            text("Symbol")
+                .size(fs)
+                .width(Length::FillPortion(2))
+                .style(theme::text_color(Colors::YELLOW)),
+            text("Last")
+                .size(fs)
+                .width(Length::FillPortion(2))
+                .style(theme::text_color(Colors::YELLOW)),
+            text("Chg%")
+                .size(fs)
+                .width(Length::FillPortion(2))
+                .style(theme::text_color(Colors::YELLOW)),
+            text("Volume")
+                .size(fs)
+                .width(Length::FillPortion(3))
+                .style(theme::text_color(Colors::YELLOW)),
+            text("Name")
+                .size(fs)
+                .width(Length::FillPortion(4))
+                .style(theme::text_color(Colors::YELLOW)),
+        ]
+        .spacing(4)
+        .padding([0, 4]);
+
+        let mut rows_col = column![header].spacing(0);
+
+        for (i, r) in self.scan_results.iter().enumerate() {
+            let price = r.last.map(|p| format!("{p:.2}")).unwrap_or("-".into());
+            let chg_str = r
+                .change_pct
+                .map(|c| format!("{c:+.1}%"))
+                .unwrap_or("-".into());
+            let vol_str = r.volume.map(format_volume).unwrap_or("-".into());
+            let name = r.name.as_deref().unwrap_or("-");
+            let name = if name.len() > 18 {
+                format!("{}..", &name[..16])
+            } else {
+                name.to_string()
+            };
+
+            let chg_color = if r.change_pct.unwrap_or(0.0) >= 0.0 {
+                Colors::GREEN
+            } else {
+                Colors::RED
+            };
+
+            let row_content = row![
+                text(format!("{}", r.rank))
+                    .size(fs)
+                    .width(Length::FillPortion(1))
+                    .style(theme::text_dim),
+                text(&r.symbol)
+                    .size(fs)
+                    .width(Length::FillPortion(2))
+                    .style(theme::text_color(Colors::CYAN)),
+                text(price).size(fs).width(Length::FillPortion(2)),
+                text(chg_str)
+                    .size(fs)
+                    .width(Length::FillPortion(2))
+                    .style(theme::text_color(chg_color)),
+                text(vol_str).size(fs).width(Length::FillPortion(3)),
+                text(name).size(fs).width(Length::FillPortion(4)),
+            ]
+            .spacing(4)
+            .padding([2, 4]);
+
+            let is_selected = i == self.selected_scan_row;
+            let row_btn = button(row_content)
+                .on_press(Message::SelectScanResult(i))
+                .padding(0)
+                .width(Length::Fill)
+                .style(theme::alert_row_style(is_selected));
+
+            rows_col = rows_col.push(row_btn);
+        }
+
+        container(scrollable(rows_col).height(Length::Fill))
+            .width(Length::FillPortion(pct))
+            .height(Length::Fill)
+            .padding(4)
+            .style(theme::card_container)
+            .into()
+    }
+
+    /// Detail panel for a selected scan result (right side of split).
+    fn scan_result_detail_view(&self, fs: u32, pct: u16) -> Element<Message> {
+        let mut lines = column![].spacing(4).padding(8);
+
+        if self.scan_results.is_empty()
+            || self.selected_scan_row >= self.scan_results.len()
+        {
+            lines = lines.push(text("No stock selected").size(fs + 1).style(theme::text_dim));
+            return container(lines)
+                .width(Length::FillPortion(pct))
+                .height(Length::Fill)
+                .style(theme::card_container)
+                .into();
+        }
+
+        let r = &self.scan_results[self.selected_scan_row];
+
+        lines = lines.push(
+            text(&r.symbol)
+                .size(fs + 6)
+                .style(theme::text_color(Colors::CYAN)),
+        );
+        lines = lines.push(Space::new().height(4));
+
+        macro_rules! label {
+            ($s:expr) => {
+                text(String::from($s))
+                    .size(fs)
+                    .width(Length::FillPortion(2))
+                    .style(theme::text_color(Colors::YELLOW))
+            };
+        }
+        macro_rules! val {
+            ($s:expr) => {
+                text($s).size(fs).width(Length::FillPortion(3))
+            };
+        }
+
+        // Rank
+        lines = lines.push(row![label!("Rank"), val!(format!("#{}", r.rank))]);
+
+        // Price
+        let price_str = r.last.map(|p| format!("${p:.2}")).unwrap_or("-".into());
+        lines = lines.push(row![label!("Price"), val!(price_str)]);
+
+        // Change%
+        let chg_str = r
+            .change_pct
+            .map(|c| format!("{c:+.1}%"))
+            .unwrap_or("-".into());
+        let chg_color = if r.change_pct.unwrap_or(0.0) >= 0.0 {
+            Colors::GREEN
+        } else {
+            Colors::RED
+        };
+        lines = lines.push(row![
+            label!("Change"),
+            text(chg_str)
+                .size(fs)
+                .width(Length::FillPortion(3))
+                .style(theme::text_color(chg_color))
+        ]);
+
+        // Volume
+        let vol_str = r.volume.map(format_volume).unwrap_or("-".into());
+        lines = lines.push(row![label!("Volume"), val!(vol_str)]);
+
+        // RVol
+        let rvol_str = r.rvol.map(|v| format!("{v:.1}x")).unwrap_or("-".into());
+        lines = lines.push(row![label!("RVol"), val!(rvol_str)]);
+
+        // Float
+        let float_str = r
+            .float_shares
+            .map(|v| {
+                if v >= 1e9 {
+                    format!("{:.1}B", v / 1e9)
+                } else if v >= 1e6 {
+                    format!("{:.1}M", v / 1e6)
+                } else if v >= 1e3 {
+                    format!("{:.0}K", v / 1e3)
+                } else {
+                    format!("{v:.0}")
+                }
+            })
+            .unwrap_or("-".into());
+        lines = lines.push(row![label!("Float"), val!(float_str)]);
+
+        // Short%
+        let short_str = r
+            .short_pct
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or("-".into());
+        lines = lines.push(row![label!("Short%"), val!(short_str)]);
+
+        lines = lines.push(Space::new().height(4));
+
+        // Name, Sector, Industry
+        let name_str = r.name.as_deref().unwrap_or("-").to_string();
+        lines = lines.push(row![label!("Name"), val!(name_str)]);
+
+        let sector_str = r.sector.as_deref().unwrap_or("-").to_string();
+        lines = lines.push(row![label!("Sector"), val!(sector_str)]);
+
+        let industry_str = r.industry.as_deref().unwrap_or("-").to_string();
+        lines = lines.push(row![label!("Industry"), val!(industry_str)]);
+
+        // Catalyst
+        if let Some(ref catalyst) = r.catalyst {
+            lines = lines.push(Space::new().height(4));
+            lines = lines.push(row![label!("Catalyst"), val!(catalyst.clone())]);
+        }
+
+        // Bid/Ask
+        if r.bid.is_some() || r.ask.is_some() {
+            lines = lines.push(Space::new().height(4));
+            let bid_str = r.bid.map(|p| format!("${p:.2}")).unwrap_or("-".into());
+            let ask_str = r.ask.map(|p| format!("${p:.2}")).unwrap_or("-".into());
+            lines = lines.push(row![label!("Bid"), val!(bid_str)]);
+            lines = lines.push(row![label!("Ask"), val!(ask_str)]);
+        }
+
+        // Close
+        if let Some(close) = r.close {
+            let close_str = format!("${close:.2}");
+            lines = lines.push(row![label!("Prev Close"), val!(close_str)]);
+        }
+
+        container(scrollable(lines).height(Length::Fill))
+            .width(Length::FillPortion(pct))
+            .height(Length::Fill)
+            .style(theme::card_container)
             .into()
     }
 
@@ -387,5 +658,15 @@ impl App {
             .padding(4)
             .style(theme::card_container)
             .into()
+    }
+}
+
+fn format_volume(vol: i64) -> String {
+    if vol >= 1_000_000 {
+        format!("{:.1}M", vol as f64 / 1_000_000.0)
+    } else if vol >= 1_000 {
+        format!("{:.0}K", vol as f64 / 1_000.0)
+    } else {
+        format!("{vol}")
     }
 }

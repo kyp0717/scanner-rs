@@ -79,6 +79,7 @@ pub enum EngineEvent {
     },
     EnrichComplete {
         symbol: String,
+        data: EnrichmentData,
     },
     PortDiscovered {
         port: u16,
@@ -296,6 +297,8 @@ impl AlertEngine {
                     if let Some(p) = port {
                         self.connected_port = Some(p);
                         events.push(EngineEvent::PortDiscovered { port: p });
+                    } else {
+                        self.connected_port = None;
                     }
                     self.bg_busy = false;
                     // Queue enrichment for scan results
@@ -321,6 +324,8 @@ impl AlertEngine {
                     if let Some(p) = port {
                         self.connected_port = Some(p);
                         events.push(EngineEvent::PortDiscovered { port: p });
+                    } else {
+                        self.connected_port = None;
                     }
 
                     // Write to Supabase (background, non-blocking)
@@ -486,6 +491,7 @@ impl AlertEngine {
                     info!(symbol = %symbol, catalyst = cat, float = %float_str, "enriched");
 
                     // Update matching AlertRow
+                    let data_clone = data.clone();
                     if let Some(row) =
                         self.alert_rows.iter_mut().find(|r| r.symbol == symbol)
                     {
@@ -506,7 +512,7 @@ impl AlertEngine {
                         row.enriched = true;
                     }
 
-                    events.push(EngineEvent::EnrichComplete { symbol });
+                    events.push(EngineEvent::EnrichComplete { symbol, data: data_clone });
                 }
                 BgMessage::MarketDataTick {
                     symbol,

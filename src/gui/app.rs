@@ -41,6 +41,7 @@ pub enum Message {
     InputChanged(String),
     SubmitCommand,
     SelectAlert(usize),
+    SelectScanResult(usize),
     IncreaseFontSize,
     DecreaseFontSize,
     SplitLeft,
@@ -73,6 +74,9 @@ pub struct App {
     _runtime: tokio::runtime::Runtime,
     pub last_poll: std::time::Instant,
     pub scanner_selected: Option<String>,
+    pub scan_results: Vec<ScanResult>,
+    pub selected_scan_row: usize,
+    pub scan_results_code: String,
 }
 
 impl App {
@@ -101,6 +105,9 @@ impl App {
             _runtime: rt,
             last_poll: std::time::Instant::now(),
             scanner_selected: Some("__alert__".to_string()),
+            scan_results: Vec::new(),
+            selected_scan_row: 0,
+            scan_results_code: String::new(),
         }
     }
 
@@ -557,6 +564,12 @@ impl App {
                     results.len()
                 ));
                 self.clear_output();
+
+                // Store structured results for scanner detail panel
+                self.scan_results = results.clone();
+                self.selected_scan_row = 0;
+                self.scan_results_code = scanner_code.clone();
+
                 if results.is_empty() {
                     self.push_output("No results.");
                     self.alert_line = format!("{scanner_code} -- 0 results");
@@ -695,24 +708,36 @@ impl App {
                     }
                 }
             }
-            EngineEvent::EnrichComplete { symbol } => {
-                if let Some(r) = self.engine.alert_rows.iter().find(|r| r.symbol == symbol) {
-                    let catalyst = r.catalyst.as_deref().unwrap_or("none");
-                    let float = r
-                        .float_shares
-                        .map(|f| {
-                            if f >= 1_000_000.0 {
-                                format!("{:.1}M", f / 1_000_000.0)
-                            } else if f >= 1_000.0 {
-                                format!("{:.0}K", f / 1_000.0)
-                            } else {
-                                format!("{f:.0}")
-                            }
-                        })
-                        .unwrap_or_else(|| "-".to_string());
-                    self.push_log("enrich", &format!("{symbol} -- {catalyst} (float: {float})"));
-                } else {
-                    self.push_log("enrich", &format!("{symbol}"));
+            EngineEvent::EnrichComplete { symbol, data } => {
+                let catalyst = data.catalyst.as_deref().unwrap_or("none");
+                let float = data
+                    .float_shares
+                    .map(|f| {
+                        if f >= 1_000_000.0 {
+                            format!("{:.1}M", f / 1_000_000.0)
+                        } else if f >= 1_000.0 {
+                            format!("{:.0}K", f / 1_000.0)
+                        } else {
+                            format!("{f:.0}")
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                self.push_log("enrich", &format!("{symbol} -- {catalyst} (float: {float})"));
+
+                // Update matching scan result (scanner view detail panel)
+                if let Some(sr) = self.scan_results.iter_mut().find(|r| r.symbol == symbol) {
+                    sr.name = data.name;
+                    sr.sector = data.sector;
+                    sr.industry = data.industry;
+                    sr.float_shares = data.float_shares;
+                    sr.short_pct = data.short_pct;
+                    sr.catalyst = data.catalyst;
+                    sr.avg_volume = data.avg_volume;
+                    if let (Some(vol), Some(avg)) = (sr.volume, data.avg_volume) {
+                        if avg > 0 {
+                            sr.rvol = Some(vol as f64 / avg as f64);
+                        }
+                    }
                 }
             }
             EngineEvent::PortDiscovered { port } => {
@@ -771,6 +796,9 @@ impl App {
             }
             Message::SelectAlert(i) => {
                 self.selected_alert_row = i;
+            }
+            Message::SelectScanResult(i) => {
+                self.selected_scan_row = i;
             }
             Message::IncreaseFontSize => {
                 if self.font_size < 24 {
