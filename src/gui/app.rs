@@ -278,8 +278,8 @@ impl App {
             return;
         }
 
-        if self.engine.bg_busy {
-            self.push_output("Background operation in progress, please wait...");
+        if self.engine.scan_busy {
+            self.push_output("Scan already in progress, please wait...");
             return;
         }
 

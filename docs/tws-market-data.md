@@ -61,7 +61,8 @@ Engine tick() updates AlertRow prices
 | 1 | Interactive one-shot scan | Ephemeral |
 | 3 | Scanner parameters fetch | Ephemeral |
 | 10 | Poll scan (8 scanners) | Ephemeral per cycle |
-| 20 | Snapshot market data | Ephemeral per cycle |
+| 20 | Snapshot market data (one-shot scan) | Ephemeral per scan |
+| 21 | Snapshot market data (poll scan) | Ephemeral per cycle |
 | 30 | Streaming market data | Persistent |
 
 ## Known Issues & Fixes
@@ -79,6 +80,18 @@ Engine tick() updates AlertRow prices
 **Fix**: `run_poll_scan()` now calls `fetch_snapshots()` (capped at 50 symbols) to provide immediate prices. Streaming continues to update prices for subscribed symbols afterward.
 
 **Remaining limitation**: Only the top 50 symbols get snapshot prices per poll cycle. Symbols beyond 50 depend on streaming, which may hit the subscription limit. This is acceptable because the alert table is sorted by scanner hits — the most important stocks get prices first.
+
+### One-Shot Scan Blocked by Polling
+
+**Symptom**: Clicking a scanner in the scanner view returns no results.
+
+**Root cause**: Both one-shot scans and poll cycles shared a single `bg_busy` flag. After adding `fetch_snapshots()` to poll cycles, polls could take up to 15 seconds (50 symbols × 3s timeout in chunks of 10) — the entire poll interval. The one-shot scan was blocked for the full duration.
+
+**Fix**: Separated into two independent flags:
+- `bg_busy` — poll cycles and list fetches
+- `scan_busy` — one-shot scans only
+
+Each uses a different TWS snapshot client_id (20 for one-shot, 21 for poll) to avoid connection conflicts. One-shot scans now run regardless of whether a poll cycle is active.
 
 ### TWS Connection Status Stuck on "Connected"
 

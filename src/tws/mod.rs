@@ -138,7 +138,7 @@ pub async fn run_scan(
             .into_iter()
             .map(|r| (r.symbol.clone(), r))
             .collect();
-        fetch_snapshots(&mut data_map, host, ports, 50).await;
+        fetch_snapshots(&mut data_map, host, ports, 50, 20).await;
         results = data_map.into_values().collect();
         results.sort_by_key(|r| r.rank);
     }
@@ -205,7 +205,7 @@ pub async fn run_poll_scan(
 
     // Fetch snapshots for initial prices (streaming updates them later)
     if !symbol_data.is_empty() {
-        fetch_snapshots(&mut symbol_data, host, ports, 50).await;
+        fetch_snapshots(&mut symbol_data, host, ports, 50, 21).await;
     }
 
     (symbol_scanners, symbol_data, Some(port))
@@ -280,18 +280,19 @@ async fn fetch_one_snapshot(client: &ibapi::Client, symbol: &str, currency: &str
 /// Fetch market data snapshots for a batch of scan results.
 /// Populates last, bid, ask, volume, close, and computes change_pct.
 /// Limited to `max_symbols`; requests run concurrently in chunks of 10.
+/// `client_id`: use 20 for one-shot scans, 21 for poll scans (avoids TWS conflicts).
 pub async fn fetch_snapshots(
     results: &mut HashMap<String, ScanResult>,
     host: &str,
     ports: &[u16],
     max_symbols: usize,
+    client_id: i32,
 ) {
     if results.is_empty() {
         return;
     }
 
-    // Use client_id 20 for snapshot requests
-    let (client, _port) = match connect(host, ports, 20).await {
+    let (client, _port) = match connect(host, ports, client_id).await {
         Ok(c) => c,
         Err(e) => {
             warn!("Snapshot connect failed: {e}");

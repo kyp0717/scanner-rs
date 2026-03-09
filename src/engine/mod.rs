@@ -105,6 +105,7 @@ pub struct AlertEngine {
     pub bg_tx: mpsc::Sender<BgMessage>,
     pub bg_rx: mpsc::Receiver<BgMessage>,
     pub bg_busy: bool,
+    pub scan_busy: bool,
     pub enrich_tx: mpsc::Sender<EnrichRequest>,
     pub mktdata_tx: Option<mpsc::Sender<MktDataRequest>>,
 }
@@ -127,6 +128,7 @@ impl AlertEngine {
             bg_tx,
             bg_rx,
             bg_busy: false,
+            scan_busy: false,
             enrich_tx,
             mktdata_tx: None,
         }
@@ -162,10 +164,10 @@ impl AlertEngine {
         min_price: Option<f64>,
         max_price: Option<f64>,
     ) {
-        if self.bg_busy {
+        if self.scan_busy {
             return;
         }
-        self.bg_busy = true;
+        self.scan_busy = true;
 
         let ports: Vec<u16> = self
             .settings
@@ -300,7 +302,7 @@ impl AlertEngine {
                     } else {
                         self.connected_port = None;
                     }
-                    self.bg_busy = false;
+                    self.scan_busy = false;
                     // Queue enrichment for scan results
                     for r in &results {
                         self.queue_enrich(&r.symbol, 1);
