@@ -238,6 +238,10 @@ impl App {
         let vol_str = r.volume.map(format_volume).unwrap_or("-".into());
         lines = lines.push(row![label!("Volume"), val!(vol_str)]);
 
+        // Avg Volume
+        let avg_vol_str = fmt_or_dots(r.enriched, r.avg_volume.map(format_volume));
+        lines = lines.push(row![label!("Avg Vol"), val!(avg_vol_str)]);
+
         // RVol
         let rvol_str = fmt_or_dots(r.enriched, r.rvol.map(|v| format!("{v:.1}x")));
         lines = lines.push(row![label!("RVol"), val!(rvol_str)]);
@@ -275,6 +279,9 @@ impl App {
 
         let industry_str = fmt_or_dots(r.enriched, r.industry.clone());
         lines = lines.push(row![label!("Industry"), val!(industry_str)]);
+
+        let country_str = fmt_or_dots(r.enriched, r.country.clone());
+        lines = lines.push(row![label!("Country"), val!(country_str)]);
 
         lines = lines.push(Space::new().height(4));
 

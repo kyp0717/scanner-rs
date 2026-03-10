@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -30,6 +30,11 @@ pub enum BgMessage {
     EnrichComplete {
         symbol: String,
         data: EnrichmentData,
+    },
+    /// Periodic news-only refresh for a symbol.
+    NewsRefresh {
+        symbol: String,
+        update: crate::enrichment::NewsUpdate,
     },
     /// Real-time market data tick from the streaming thread.
     MarketDataTick {
@@ -80,6 +85,10 @@ pub enum EngineEvent {
     EnrichComplete {
         symbol: String,
         data: EnrichmentData,
+    },
+    NewsRefresh {
+        symbol: String,
+        update: crate::enrichment::NewsUpdate,
     },
     PortDiscovered {
         port: u16,
@@ -396,6 +405,7 @@ impl AlertEngine {
                                 name: None,
                                 sector: None,
                                 industry: None,
+                                country: None,
                                 catalyst: None,
                                 catalyst_time: None,
                                 scanner_hits: hits,
@@ -500,6 +510,7 @@ impl AlertEngine {
                         row.name = data.name;
                         row.sector = data.sector;
                         row.industry = data.industry;
+                        row.country = data.country;
                         row.float_shares = data.float_shares;
                         row.short_pct = data.short_pct;
                         row.catalyst = data.catalyst;
@@ -515,6 +526,21 @@ impl AlertEngine {
                     }
 
                     events.push(EngineEvent::EnrichComplete { symbol, data: data_clone });
+                }
+                BgMessage::NewsRefresh { symbol, update } => {
+                    if let Some(row) =
+                        self.alert_rows.iter_mut().find(|r| r.symbol == symbol)
+                    {
+                        // Update catalyst if we didn't have one, or if a new one is found
+                        if update.catalyst.is_some() {
+                            row.catalyst = update.catalyst.clone();
+                            row.catalyst_time = update.catalyst_time;
+                        }
+                        if !update.news_headlines.is_empty() {
+                            row.news_headlines = update.news_headlines.clone();
+                        }
+                    }
+                    events.push(EngineEvent::NewsRefresh { symbol, update });
                 }
                 BgMessage::MarketDataTick {
                     symbol,
@@ -631,6 +657,7 @@ impl AlertEngine {
                         name: s.name.clone(),
                         sector: s.sector.clone(),
                         industry: s.industry.clone(),
+                        country: None,
                         catalyst: s.catalyst.clone(),
                         catalyst_time: s.catalyst_time,
                         scanner_hits: n_scans,
@@ -667,6 +694,8 @@ pub fn spawn_enrichment_worker(
         let mut heap = BinaryHeap::<EnrichRequest>::new();
         let mut enriched_set = HashSet::<String>::new();
         let mut yahoo_auth: Option<YahooAuth> = None;
+        let mut last_news_refresh = Instant::now();
+        let mut news_refresh_idx: usize = 0;
 
         loop {
             // Drain all pending requests into the priority queue
@@ -724,12 +753,45 @@ pub fn spawn_enrichment_worker(
                     symbol: req.symbol,
                     data,
                 });
+            } else if !enriched_set.is_empty()
+                && last_news_refresh.elapsed() >= Duration::from_secs(5 * 60)
+            {
+                // News refresh cycle: fetch RSS news for enriched symbols
+                // Process one symbol per loop iteration to stay responsive
+                // to new enrichment requests
+                let symbols: Vec<String> = enriched_set.iter().cloned().collect();
+                if news_refresh_idx >= symbols.len() {
+                    news_refresh_idx = 0;
+                    last_news_refresh = Instant::now();
+                } else {
+                    let sym = &symbols[news_refresh_idx];
+                    if let Some(update) =
+                        rt_handle.block_on(crate::enrichment::fetch_news_only(&client, sym))
+                    {
+                        let _ = bg_tx.send(BgMessage::NewsRefresh {
+                            symbol: sym.clone(),
+                            update,
+                        });
+                    }
+                    news_refresh_idx += 1;
+                    // Check for incoming requests between each fetch
+                    while let Ok(req) = enrich_rx.try_recv() {
+                        if req.symbol.is_empty() {
+                            enriched_set.clear();
+                            news_refresh_idx = 0;
+                            heap.clear();
+                        } else if !enriched_set.contains(&req.symbol) {
+                            heap.push(req);
+                        }
+                    }
+                }
             } else {
-                // Nothing to do — block until a request arrives
+                // Nothing to do — block until a request arrives or timeout
                 match enrich_rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(req) => {
                         if req.symbol.is_empty() {
                             enriched_set.clear();
+                            news_refresh_idx = 0;
                         } else if !enriched_set.contains(&req.symbol) {
                             heap.push(req);
                         }
@@ -852,16 +914,21 @@ pub fn spawn_market_data_worker(
                                             ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
                                             _ => continue,
                                         },
-                                        TickTypes::PriceSize(tp) => match tp.price_tick_type {
-                                            ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
-                                            ibapi::contracts::tick_types::TickType::Close => {
-                                                close = Some(tp.price);
-                                                stored_close = close;
+                                        TickTypes::PriceSize(tp) => {
+                                            match tp.price_tick_type {
+                                                ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
+                                                ibapi::contracts::tick_types::TickType::Close => {
+                                                    close = Some(tp.price);
+                                                    stored_close = close;
+                                                }
+                                                ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
+                                                ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
+                                                _ => {}
                                             }
-                                            ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
-                                            ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
-                                            _ => continue,
-                                        },
+                                            if tp.size_tick_type == ibapi::contracts::tick_types::TickType::Volume {
+                                                volume = Some(tp.size as i64);
+                                            }
+                                        }
                                         TickTypes::Size(ts) => {
                                             if ts.tick_type == ibapi::contracts::tick_types::TickType::Volume {
                                                 volume = Some(ts.size as i64);
@@ -967,6 +1034,7 @@ mod tests {
             name: None,
             sector: None,
             industry: None,
+            country: None,
             catalyst: None,
             catalyst_time: None,
             scanner_hits: 3,

@@ -570,6 +570,31 @@ impl App {
                 self.selected_scan_row = 0;
                 self.scan_results_code = scanner_code.clone();
 
+                // Back-fill enrichment from alert rows (enrichment worker
+                // deduplicates, so symbols already enriched won't fire again)
+                for sr in &mut self.scan_results {
+                    if sr.enriched {
+                        continue;
+                    }
+                    if let Some(ar) = self.engine.alert_rows.iter().find(|a| a.symbol == sr.symbol && a.enriched) {
+                        sr.name = ar.name.clone();
+                        sr.sector = ar.sector.clone();
+                        sr.industry = ar.industry.clone();
+                        sr.country = ar.country.clone();
+                        sr.float_shares = ar.float_shares;
+                        sr.short_pct = ar.short_pct;
+                        sr.avg_volume = ar.avg_volume;
+                        sr.catalyst = ar.catalyst.clone();
+                        sr.news_headlines = ar.news_headlines.clone();
+                        sr.enriched = true;
+                        if let (Some(vol), Some(avg)) = (sr.volume, ar.avg_volume) {
+                            if avg > 0 {
+                                sr.rvol = Some(vol as f64 / avg as f64);
+                            }
+                        }
+                    }
+                }
+
                 if results.is_empty() {
                     self.push_output("No results.");
                     self.alert_line = format!("{scanner_code} -- 0 results");
@@ -729,14 +754,28 @@ impl App {
                     sr.name = data.name;
                     sr.sector = data.sector;
                     sr.industry = data.industry;
+                    sr.country = data.country;
                     sr.float_shares = data.float_shares;
                     sr.short_pct = data.short_pct;
                     sr.catalyst = data.catalyst;
+                    sr.news_headlines = data.news_headlines;
                     sr.avg_volume = data.avg_volume;
+                    sr.enriched = true;
                     if let (Some(vol), Some(avg)) = (sr.volume, data.avg_volume) {
                         if avg > 0 {
                             sr.rvol = Some(vol as f64 / avg as f64);
                         }
+                    }
+                }
+            }
+            EngineEvent::NewsRefresh { symbol, update } => {
+                // Update scan results
+                if let Some(sr) = self.scan_results.iter_mut().find(|r| r.symbol == symbol) {
+                    if update.catalyst.is_some() {
+                        sr.catalyst = update.catalyst.clone();
+                    }
+                    if !update.news_headlines.is_empty() {
+                        sr.news_headlines = update.news_headlines;
                     }
                 }
             }

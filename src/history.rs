@@ -291,6 +291,7 @@ impl SupabaseClient {
             name: row.get("name").and_then(|v| v.as_str()).map(String::from),
             sector: row.get("sector").and_then(|v| v.as_str()).map(String::from),
             industry: row.get("industry").and_then(|v| v.as_str()).map(String::from),
+            country: None,
             float_shares: row.get("float_shares").and_then(|v| v.as_f64()),
             short_pct: row.get("short_pct").and_then(|v| v.as_f64()),
             avg_volume: row.get("avg_volume").and_then(|v| v.as_i64()),

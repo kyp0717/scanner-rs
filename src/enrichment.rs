@@ -112,7 +112,7 @@ async fn fetch_yahoo_news(client: &Client, symbol: &str, auth: &YahooAuth) -> Re
 }
 
 /// Fetch recent news via Yahoo Finance RSS feed (no auth required, more reliable).
-async fn fetch_yahoo_news_rss(client: &Client, symbol: &str) -> Result<Vec<Value>> {
+pub async fn fetch_yahoo_news_rss(client: &Client, symbol: &str) -> Result<Vec<Value>> {
     let url = format!(
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s={}&region=US&lang=en-US",
         symbol
@@ -204,6 +204,7 @@ pub struct EnrichmentData {
     pub name: Option<String>,
     pub sector: Option<String>,
     pub industry: Option<String>,
+    pub country: Option<String>,
     pub float_shares: Option<f64>,
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
@@ -230,6 +231,7 @@ pub async fn fetch_enrichment_with_auth(
         data.name = extract_str(&info, "price", "shortName");
         data.sector = extract_str(&info, "summaryProfile", "sector");
         data.industry = extract_str(&info, "summaryProfile", "industry");
+        data.country = extract_str(&info, "summaryProfile", "country");
         data.float_shares = extract_raw(&info, "defaultKeyStatistics", "floatShares")
             .and_then(|v| v.as_f64());
         data.short_pct = extract_raw(&info, "defaultKeyStatistics", "shortPercentOfFloat")
@@ -263,6 +265,39 @@ pub async fn fetch_enrichment_with_auth(
         .collect();
 
     data
+}
+
+/// News-only refresh result.
+#[derive(Debug, Clone)]
+pub struct NewsUpdate {
+    pub catalyst: Option<String>,
+    pub catalyst_time: Option<i64>,
+    pub news_headlines: Vec<NewsHeadline>,
+}
+
+/// Fetch only news for a symbol via RSS (fast, no auth needed).
+/// Returns None if no news found.
+pub async fn fetch_news_only(client: &Client, symbol: &str) -> Option<NewsUpdate> {
+    let news = fetch_yahoo_news_rss(client, symbol).await.ok()?;
+    if news.is_empty() {
+        return None;
+    }
+    let (catalyst, catalyst_time) = classify_catalyst(&news)
+        .map(|(c, t)| (Some(c), t))
+        .unwrap_or((None, None));
+    let headlines: Vec<NewsHeadline> = news
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            let published = item.get("providerPublishTime").and_then(|t| t.as_i64());
+            Some(NewsHeadline { title, published })
+        })
+        .collect();
+    Some(NewsUpdate {
+        catalyst,
+        catalyst_time,
+        news_headlines: headlines,
+    })
 }
 
 /// Fetch enrichment data for a single symbol (fetches auth internally).
@@ -305,6 +340,7 @@ pub async fn enrich_results(results: &mut [ScanResult]) {
             r.name = data.name;
             r.sector = data.sector;
             r.industry = data.industry;
+            r.country = data.country;
             r.float_shares = data.float_shares;
             r.short_pct = data.short_pct;
             r.avg_volume = data.avg_volume;

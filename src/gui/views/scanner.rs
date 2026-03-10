@@ -498,14 +498,18 @@ impl App {
         let vol_str = r.volume.map(format_volume).unwrap_or("-".into());
         lines = lines.push(row![label!("Volume"), val!(vol_str)]);
 
+        // Avg Volume
+        let avg_vol_str = fmt_or_dots(r.enriched, r.avg_volume.map(format_volume));
+        lines = lines.push(row![label!("Avg Vol"), val!(avg_vol_str)]);
+
         // RVol
-        let rvol_str = r.rvol.map(|v| format!("{v:.1}x")).unwrap_or("-".into());
+        let rvol_str = fmt_or_dots(r.enriched, r.rvol.map(|v| format!("{v:.1}x")));
         lines = lines.push(row![label!("RVol"), val!(rvol_str)]);
 
         // Float
-        let float_str = r
-            .float_shares
-            .map(|v| {
+        let float_str = fmt_or_dots(
+            r.enriched,
+            r.float_shares.map(|v| {
                 if v >= 1e9 {
                     format!("{:.1}B", v / 1e9)
                 } else if v >= 1e6 {
@@ -515,34 +519,33 @@ impl App {
                 } else {
                     format!("{v:.0}")
                 }
-            })
-            .unwrap_or("-".into());
+            }),
+        );
         lines = lines.push(row![label!("Float"), val!(float_str)]);
 
         // Short%
-        let short_str = r
-            .short_pct
-            .map(|v| format!("{:.1}%", v * 100.0))
-            .unwrap_or("-".into());
+        let short_str =
+            fmt_or_dots(r.enriched, r.short_pct.map(|v| format!("{:.1}%", v * 100.0)));
         lines = lines.push(row![label!("Short%"), val!(short_str)]);
 
         lines = lines.push(Space::new().height(4));
 
-        // Name, Sector, Industry
-        let name_str = r.name.as_deref().unwrap_or("-").to_string();
+        // Name, Sector, Industry, Country
+        let name_str = fmt_or_dots(r.enriched, r.name.clone());
         lines = lines.push(row![label!("Name"), val!(name_str)]);
 
-        let sector_str = r.sector.as_deref().unwrap_or("-").to_string();
+        let sector_str = fmt_or_dots(r.enriched, r.sector.clone());
         lines = lines.push(row![label!("Sector"), val!(sector_str)]);
 
-        let industry_str = r.industry.as_deref().unwrap_or("-").to_string();
+        let industry_str = fmt_or_dots(r.enriched, r.industry.clone());
         lines = lines.push(row![label!("Industry"), val!(industry_str)]);
 
+        let country_str = fmt_or_dots(r.enriched, r.country.clone());
+        lines = lines.push(row![label!("Country"), val!(country_str)]);
+
         // Catalyst
-        if let Some(ref catalyst) = r.catalyst {
-            lines = lines.push(Space::new().height(4));
-            lines = lines.push(row![label!("Catalyst"), val!(catalyst.clone())]);
-        }
+        let catalyst_str = fmt_or_dots(r.enriched, r.catalyst.clone());
+        lines = lines.push(row![label!("Catalyst"), val!(catalyst_str)]);
 
         // Bid/Ask
         if r.bid.is_some() || r.ask.is_some() {
@@ -557,6 +560,56 @@ impl App {
         if let Some(close) = r.close {
             let close_str = format!("${close:.2}");
             lines = lines.push(row![label!("Prev Close"), val!(close_str)]);
+        }
+
+        // News Headlines
+        if !r.news_headlines.is_empty() {
+            lines = lines.push(Space::new().height(4));
+            lines = lines.push(
+                text("News")
+                    .size(fs)
+                    .style(theme::text_color(Colors::YELLOW)),
+            );
+            let news_size = if fs > 9 { fs - 1 } else { fs };
+            let now_ts = chrono::Utc::now().timestamp();
+            let five_days = 5 * 86400;
+            for headline in r.news_headlines.iter()
+                .filter(|h| h.published.map_or(true, |ep| now_ts - ep < five_days))
+                .take(5)
+            {
+                if let Some(epoch) = headline.published {
+                    let dt = chrono::DateTime::from_timestamp(epoch, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Local);
+                    let diff = now_ts - epoch;
+                    let ago = if diff < 60 {
+                        "now".to_string()
+                    } else if diff < 3600 {
+                        format!("{}m ago", diff / 60)
+                    } else if diff < 86400 {
+                        format!("{}h ago", diff / 3600)
+                    } else {
+                        format!("{}d ago", diff / 86400)
+                    };
+                    lines = lines.push(
+                        text(format!("  {} ({})", dt.format("%b %d %H:%M"), ago))
+                            .size(if news_size > 2 { news_size - 2 } else { news_size })
+                            .style(theme::text_dim),
+                    );
+                }
+                lines = lines.push(
+                    text(format!("  {}", headline.title))
+                        .size(news_size),
+                );
+            }
+        } else if !r.enriched {
+            lines = lines.push(row![
+                label!("News"),
+                text(String::from("..."))
+                    .size(fs)
+                    .width(Length::FillPortion(3))
+                    .style(theme::text_dim)
+            ]);
         }
 
         container(scrollable(lines).height(Length::Fill))
@@ -668,5 +721,13 @@ fn format_volume(vol: i64) -> String {
         format!("{:.0}K", vol as f64 / 1_000.0)
     } else {
         format!("{vol}")
+    }
+}
+
+fn fmt_or_dots(enriched: bool, val: Option<String>) -> String {
+    match val {
+        Some(v) if !v.is_empty() => v,
+        _ if enriched => "-".into(),
+        _ => "...".into(),
     }
 }

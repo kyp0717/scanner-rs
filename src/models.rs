@@ -26,11 +26,14 @@ pub struct ScanResult {
     pub name: Option<String>,
     pub sector: Option<String>,
     pub industry: Option<String>,
+    pub country: Option<String>,
     pub float_shares: Option<f64>,
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
     pub catalyst: Option<String>,
     pub rvol: Option<f64>,
+    pub news_headlines: Vec<NewsHeadline>,
+    pub enriched: bool,
 }
 
 /// Row in the alert table (accumulated during polling).
@@ -47,6 +50,7 @@ pub struct AlertRow {
     pub name: Option<String>,
     pub sector: Option<String>,
     pub industry: Option<String>,
+    pub country: Option<String>,
     pub catalyst: Option<String>,
     pub catalyst_time: Option<i64>,
     pub scanner_hits: u32,

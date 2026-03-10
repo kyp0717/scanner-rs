@@ -255,13 +255,18 @@ async fn fetch_one_snapshot(client: &ibapi::Client, symbol: &str, currency: &str
                     TickType::Ask => ask = Some(tp.price),
                     _ => {}
                 },
-                TickTypes::PriceSize(tp) => match tp.price_tick_type {
-                    TickType::Last => last = Some(tp.price),
-                    TickType::Close => close = Some(tp.price),
-                    TickType::Bid => bid = Some(tp.price),
-                    TickType::Ask => ask = Some(tp.price),
-                    _ => {}
-                },
+                TickTypes::PriceSize(tp) => {
+                    match tp.price_tick_type {
+                        TickType::Last => last = Some(tp.price),
+                        TickType::Close => close = Some(tp.price),
+                        TickType::Bid => bid = Some(tp.price),
+                        TickType::Ask => ask = Some(tp.price),
+                        _ => {}
+                    }
+                    if tp.size_tick_type == TickType::Volume {
+                        volume = Some(tp.size as i64);
+                    }
+                }
                 TickTypes::Size(ts) => {
                     if ts.tick_type == TickType::Volume {
                         volume = Some(ts.size as i64);
