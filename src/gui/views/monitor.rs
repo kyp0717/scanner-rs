@@ -34,7 +34,7 @@ impl App {
         let poll_text = if self.engine.polling {
             let elapsed = self.last_poll.elapsed().as_secs();
             let remaining = 15u64.saturating_sub(elapsed);
-            if self.engine.bg_busy {
+            if self.engine.poll_busy {
                 text("Scanning...".to_string())
                     .size(self.font_size + 1)
                     .style(theme::text_color(Colors::YELLOW))

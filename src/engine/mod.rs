@@ -104,7 +104,7 @@ pub struct AlertEngine {
     pub db: Option<SupabaseClient>,
     pub bg_tx: mpsc::Sender<BgMessage>,
     pub bg_rx: mpsc::Receiver<BgMessage>,
-    pub bg_busy: bool,
+    pub poll_busy: bool,
     pub scan_busy: bool,
     pub enrich_tx: mpsc::Sender<EnrichRequest>,
     pub mktdata_tx: Option<mpsc::Sender<MktDataRequest>>,
@@ -127,7 +127,7 @@ impl AlertEngine {
             db,
             bg_tx,
             bg_rx,
-            bg_busy: false,
+            poll_busy: false,
             scan_busy: false,
             enrich_tx,
             mktdata_tx: None,
@@ -193,10 +193,10 @@ impl AlertEngine {
 
     /// Start a list/scanner-params fetch in a background thread.
     pub fn start_list(&mut self, group: Option<String>) {
-        if self.bg_busy {
+        if self.poll_busy {
             return;
         }
-        self.bg_busy = true;
+        self.poll_busy = true;
 
         let ports: Vec<u16> = self
             .settings
@@ -250,10 +250,10 @@ impl AlertEngine {
 
     /// Spawn the multi-scanner poll in a background thread.
     pub fn run_poll_scanners(&mut self) {
-        if self.bg_busy {
+        if self.poll_busy {
             return;
         }
-        self.bg_busy = true;
+        self.poll_busy = true;
 
         let ports: Vec<u16> = self
             .settings
@@ -313,7 +313,7 @@ impl AlertEngine {
                     });
                 }
                 BgMessage::ListComplete { xml, group } => {
-                    self.bg_busy = false;
+                    self.poll_busy = false;
                     events.push(EngineEvent::ListComplete { xml, group });
                 }
                 BgMessage::PollComplete {
@@ -449,7 +449,7 @@ impl AlertEngine {
                             })
                     });
 
-                    self.bg_busy = false;
+                    self.poll_busy = false;
                     events.push(EngineEvent::PollCycleComplete {
                         total_stocks,
                         new_symbols: new_syms,
@@ -934,7 +934,7 @@ mod tests {
         assert!(engine.alert_rows.is_empty());
         assert!(engine.alert_seen.is_empty());
         assert!(!engine.polling);
-        assert!(!engine.bg_busy);
+        assert!(!engine.poll_busy);
         assert!(engine.connected_port.is_none());
     }
 

@@ -416,7 +416,7 @@ pub fn run_alert(host: &str, port: Option<u16>, json: bool) -> Result<()> {
 
         // Check poll timer
         if engine.polling
-            && !engine.bg_busy
+            && !engine.poll_busy
             && poll_timer.elapsed() >= Duration::from_secs(15)
         {
             poll_timer = std::time::Instant::now();

@@ -320,7 +320,7 @@ impl App {
     }
 
     fn cmd_list(&mut self, args: &[&str]) {
-        if self.engine.bg_busy {
+        if self.engine.poll_busy {
             self.push_output("Background operation in progress, please wait...");
             return;
         }
@@ -769,7 +769,7 @@ impl App {
 
                 // Check poll timer
                 if self.engine.polling
-                    && !self.engine.bg_busy
+                    && !self.engine.poll_busy
                     && self.last_poll.elapsed() >= Duration::from_secs(15)
                 {
                     self.last_poll = std::time::Instant::now();

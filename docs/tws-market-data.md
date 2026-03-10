@@ -85,10 +85,10 @@ Engine tick() updates AlertRow prices
 
 **Symptom**: Clicking a scanner in the scanner view returns no results.
 
-**Root cause**: Both one-shot scans and poll cycles shared a single `bg_busy` flag. After adding `fetch_snapshots()` to poll cycles, polls could take up to 15 seconds (50 symbols × 3s timeout in chunks of 10) — the entire poll interval. The one-shot scan was blocked for the full duration.
+**Root cause**: Both one-shot scans and poll cycles shared a single `poll_busy` flag. After adding `fetch_snapshots()` to poll cycles, polls could take up to 15 seconds (50 symbols × 3s timeout in chunks of 10) — the entire poll interval. The one-shot scan was blocked for the full duration.
 
 **Fix**: Separated into two independent flags:
-- `bg_busy` — poll cycles and list fetches
+- `poll_busy` — poll cycles and list fetches
 - `scan_busy` — one-shot scans only
 
 Each uses a different TWS snapshot client_id (20 for one-shot, 21 for poll) to avoid connection conflicts. One-shot scans now run regardless of whether a poll cycle is active.
