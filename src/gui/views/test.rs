@@ -31,12 +31,13 @@ fn sample_data() -> Vec<StockRow> {
 }
 
 fn fmt_volume(vol: i64) -> String {
-    if vol >= 1_000_000 {
-        format!("{:.1}M", vol as f64 / 1_000_000.0)
-    } else if vol >= 1_000 {
-        format!("{:.0}K", vol as f64 / 1_000.0)
+    let shares = vol as f64 * 100.0;
+    if shares >= 1_000_000.0 {
+        format!("{:.1}M", shares / 1_000_000.0)
+    } else if shares >= 1_000.0 {
+        format!("{:.1}K", shares / 1_000.0)
     } else {
-        format!("{vol}")
+        format!("{:.0}", shares)
     }
 }
 

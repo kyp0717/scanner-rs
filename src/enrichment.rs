@@ -208,6 +208,7 @@ pub struct EnrichmentData {
     pub float_shares: Option<f64>,
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
+    pub avg_volume_10d: Option<i64>,
     pub catalyst: Option<String>,
     pub catalyst_time: Option<i64>,
     pub news_headlines: Vec<NewsHeadline>,
@@ -237,6 +238,8 @@ pub async fn fetch_enrichment_with_auth(
         data.short_pct = extract_raw(&info, "defaultKeyStatistics", "shortPercentOfFloat")
             .and_then(|v| v.as_f64());
         data.avg_volume = extract_raw(&info, "price", "averageDailyVolume3Month")
+            .and_then(|v| v.as_i64());
+        data.avg_volume_10d = extract_raw(&info, "price", "averageDailyVolume10Day")
             .and_then(|v| v.as_i64());
     } else if let Err(e) = info_result {
         warn!("Yahoo Finance info fetch failed for {symbol}: {e}");
@@ -344,10 +347,14 @@ pub async fn enrich_results(results: &mut [ScanResult]) {
             r.float_shares = data.float_shares;
             r.short_pct = data.short_pct;
             r.avg_volume = data.avg_volume;
+            r.avg_volume_10d = data.avg_volume_10d;
             r.catalyst = data.catalyst;
-            if let (Some(vol), Some(avg)) = (r.volume, data.avg_volume) {
+            // Prefer 10d avg for RVOL (more relevant for momentum), fall back to 3mo
+            let avg_for_rvol = data.avg_volume_10d.or(data.avg_volume);
+            if let (Some(vol), Some(avg)) = (r.volume, avg_for_rvol) {
                 if avg > 0 {
-                    r.rvol = Some(vol as f64 / avg as f64);
+                    // vol is IB round lots (×100), avg is Yahoo raw shares
+                    r.rvol = Some(vol as f64 * 100.0 / avg as f64);
                 }
             }
         }

@@ -202,6 +202,7 @@ impl SupabaseClient {
                     ("industry", "industry"),
                     ("short_pct", "short_pct"),
                     ("avg_volume", "avg_volume"),
+                    ("avg_volume_10d", "avg_volume_10d"),
                     ("news_headlines", "news_headlines"),
                     ("enriched_at", "enriched_at"),
                 ] {
@@ -229,7 +230,7 @@ impl SupabaseClient {
                     "name": data.get("name").cloned().unwrap_or(Value::Null),
                     "sector": data.get("sector").cloned().unwrap_or(Value::Null),
                 });
-                for key in &["industry", "short_pct", "avg_volume", "catalyst_time", "news_headlines", "enriched_at"] {
+                for key in &["industry", "short_pct", "avg_volume", "avg_volume_10d", "catalyst_time", "news_headlines", "enriched_at"] {
                     if let Some(val) = data.get(key) {
                         if !val.is_null() {
                             insert[key] = val.clone();
@@ -255,7 +256,7 @@ impl SupabaseClient {
         max_age: std::time::Duration,
     ) -> Option<EnrichmentData> {
         let query = format!(
-            "select=name,sector,industry,float_shares,short_pct,avg_volume,catalyst,catalyst_time,news_headlines,enriched_at&symbol=eq.{symbol}&limit=1"
+            "select=name,sector,industry,float_shares,short_pct,avg_volume,avg_volume_10d,catalyst,catalyst_time,news_headlines,enriched_at&symbol=eq.{symbol}&limit=1"
         );
         let rows = self.select(&query).await.ok()?;
         let row = rows.into_iter().next()?;
@@ -295,6 +296,7 @@ impl SupabaseClient {
             float_shares: row.get("float_shares").and_then(|v| v.as_f64()),
             short_pct: row.get("short_pct").and_then(|v| v.as_f64()),
             avg_volume: row.get("avg_volume").and_then(|v| v.as_i64()),
+            avg_volume_10d: row.get("avg_volume_10d").and_then(|v| v.as_i64()),
             catalyst: row.get("catalyst").and_then(|v| v.as_str()).map(String::from),
             catalyst_time: row.get("catalyst_time").and_then(|v| v.as_i64()),
             news_headlines,
@@ -467,6 +469,7 @@ mod tests {
             industry: None,
             short_pct: None,
             avg_volume: None,
+            avg_volume_10d: None,
             news_headlines: None,
             catalyst_time: None,
         }];

@@ -498,9 +498,11 @@ impl App {
         let vol_str = r.volume.map(format_volume).unwrap_or("-".into());
         lines = lines.push(row![label!("Volume"), val!(vol_str)]);
 
-        // Avg Volume
-        let avg_vol_str = fmt_or_dots(r.enriched, r.avg_volume.map(format_volume));
-        lines = lines.push(row![label!("Avg Vol"), val!(avg_vol_str)]);
+        // Avg Volume (10d and 3mo)
+        let avg_vol_10d_str = fmt_or_dots(r.enriched, r.avg_volume_10d.map(format_raw_shares));
+        let avg_vol_3mo_str = fmt_or_dots(r.enriched, r.avg_volume.map(format_raw_shares));
+        lines = lines.push(row![label!("Avg Vol 10d"), val!(avg_vol_10d_str)]);
+        lines = lines.push(row![label!("Avg Vol 3mo"), val!(avg_vol_3mo_str)]);
 
         // RVol
         let rvol_str = fmt_or_dots(r.enriched, r.rvol.map(|v| format!("{v:.1}x")));
@@ -714,13 +716,25 @@ impl App {
     }
 }
 
+/// IB TWS reports volume in round lots (100 shares). Convert to shares for display.
 fn format_volume(vol: i64) -> String {
-    if vol >= 1_000_000 {
-        format!("{:.1}M", vol as f64 / 1_000_000.0)
-    } else if vol >= 1_000 {
-        format!("{:.0}K", vol as f64 / 1_000.0)
+    // IB volume is in round lots (×100 to get shares)
+    let shares = vol as f64 * 100.0;
+    format_shares_f64(shares)
+}
+
+/// Format a value already in raw shares (e.g. Yahoo Finance avg volume).
+fn format_raw_shares(vol: i64) -> String {
+    format_shares_f64(vol as f64)
+}
+
+fn format_shares_f64(shares: f64) -> String {
+    if shares >= 1_000_000.0 {
+        format!("{:.1}M", shares / 1_000_000.0)
+    } else if shares >= 1_000.0 {
+        format!("{:.1}K", shares / 1_000.0)
     } else {
-        format!("{vol}")
+        format!("{:.0}", shares)
     }
 }
 

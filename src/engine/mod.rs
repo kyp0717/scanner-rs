@@ -413,6 +413,7 @@ impl AlertEngine {
                                 news_headlines: Vec::new(),
                                 enriched: false,
                                 avg_volume: None,
+                                avg_volume_10d: None,
                             });
                             // Subscribe to streaming market data for live price updates
                             self.subscribe_market_data(sym, &r.currency);
@@ -429,8 +430,16 @@ impl AlertEngine {
                             if r.change_pct.is_some() {
                                 row.change_pct = r.change_pct;
                             }
-                            if r.volume.is_some() {
-                                row.volume = r.volume;
+                            if let Some(v) = r.volume {
+                                row.volume = Some(v);
+                                // Recompute rvol if avg_volume is known
+                                let avg = row.avg_volume_10d.or(row.avg_volume);
+                                if let Some(avg) = avg {
+                                    if avg > 0 {
+                                        // v is IB round lots (×100), avg is Yahoo raw shares
+                                        row.rvol = Some(v as f64 * 100.0 / avg as f64);
+                                    }
+                                }
                             }
                             // Update scanner hits and list
                             if let Some(new_scanners) = symbol_scanners.get(&row.symbol) {
@@ -481,6 +490,7 @@ impl AlertEngine {
                             "industry": &data.industry,
                             "short_pct": data.short_pct,
                             "avg_volume": data.avg_volume,
+                            "avg_volume_10d": data.avg_volume_10d,
                             "news_headlines": headlines_json,
                             "enriched_at": chrono::Utc::now().to_rfc3339(),
                         });
@@ -517,9 +527,13 @@ impl AlertEngine {
                         row.catalyst_time = data.catalyst_time;
                         row.news_headlines = data.news_headlines;
                         row.avg_volume = data.avg_volume;
-                        if let (Some(vol), Some(avg)) = (row.volume, data.avg_volume) {
+                        row.avg_volume_10d = data.avg_volume_10d;
+                        // Prefer 10d avg for RVOL (more relevant for momentum), fall back to 3mo
+                        let avg_for_rvol = data.avg_volume_10d.or(data.avg_volume);
+                        if let (Some(vol), Some(avg)) = (row.volume, avg_for_rvol) {
                             if avg > 0 {
-                                row.rvol = Some(vol as f64 / avg as f64);
+                                // vol is IB round lots (×100), avg is Yahoo raw shares
+                                row.rvol = Some(vol as f64 * 100.0 / avg as f64);
                             }
                         }
                         row.enriched = true;
@@ -558,10 +572,12 @@ impl AlertEngine {
                         }
                         if let Some(v) = volume {
                             row.volume = Some(v);
-                            // Recompute rvol if avg_volume is known
-                            if let Some(avg) = row.avg_volume {
+                            // Recompute rvol: prefer 10d avg, fall back to 3mo
+                            // v is IB round lots (×100 to get shares), avg is Yahoo raw shares
+                            let avg = row.avg_volume_10d.or(row.avg_volume);
+                            if let Some(avg) = avg {
                                 if avg > 0 {
-                                    row.rvol = Some(v as f64 / avg as f64);
+                                    row.rvol = Some(v as f64 * 100.0 / avg as f64);
                                 }
                             }
                         }
@@ -665,6 +681,7 @@ impl AlertEngine {
                         news_headlines,
                         enriched: enrichment_fresh,
                         avg_volume: s.avg_volume,
+                        avg_volume_10d: s.avg_volume_10d,
                     });
                     if !enrichment_fresh {
                         needs_enrich += 1;
@@ -878,6 +895,7 @@ pub fn spawn_market_data_worker(
 
                                 let mut subscription = match client
                                     .market_data(&contract)
+                                    .generic_ticks(&["233"]) // RTVolume for streaming volume updates
                                     .subscribe()
                                     .await
                                 {
@@ -934,6 +952,20 @@ pub fn spawn_market_data_worker(
                                                 volume = Some(ts.size as i64);
                                             } else {
                                                 continue;
+                                            }
+                                        }
+                                        // RTVolume (tick 233): "price;size;time;totalVolume;vwap;single"
+                                        TickTypes::String(ts) if ts.tick_type == ibapi::contracts::tick_types::TickType::RtVolume => {
+                                            let parts: Vec<&str> = ts.value.split(';').collect();
+                                            if parts.len() >= 4 {
+                                                if let Ok(tv) = parts[3].parse::<f64>() {
+                                                    volume = Some(tv as i64);
+                                                }
+                                                if let Ok(p) = parts[0].parse::<f64>() {
+                                                    if p > 0.0 {
+                                                        last = Some(p);
+                                                    }
+                                                }
                                             }
                                         }
                                         _ => continue,
@@ -1042,6 +1074,7 @@ mod tests {
             news_headlines: Vec::new(),
             enriched: false,
             avg_volume: None,
+            avg_volume_10d: None,
         });
         let count = engine.poll_clear();
         assert_eq!(count, 2);

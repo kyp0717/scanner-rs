@@ -30,6 +30,7 @@ pub struct ScanResult {
     pub float_shares: Option<f64>,
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
+    pub avg_volume_10d: Option<i64>,
     pub catalyst: Option<String>,
     pub rvol: Option<f64>,
     pub news_headlines: Vec<NewsHeadline>,
@@ -58,6 +59,7 @@ pub struct AlertRow {
     pub news_headlines: Vec<NewsHeadline>,
     pub enriched: bool,
     pub avg_volume: Option<i64>,
+    pub avg_volume_10d: Option<i64>,
 }
 
 /// A TWS scan row from Supabase.
@@ -82,6 +84,7 @@ pub struct TwsScan {
     pub industry: Option<String>,
     pub short_pct: Option<f64>,
     pub avg_volume: Option<i64>,
+    pub avg_volume_10d: Option<i64>,
     pub news_headlines: Option<String>, // JSON array string
 }
 
@@ -194,6 +197,7 @@ mod tests {
             industry: Some("Biotech".to_string()),
             short_pct: Some(0.15),
             avg_volume: Some(1_000_000),
+            avg_volume_10d: Some(500_000),
             news_headlines: Some(r#"[{"title":"Headline 1","published":null}]"#.to_string()),
             catalyst_time: None,
         };

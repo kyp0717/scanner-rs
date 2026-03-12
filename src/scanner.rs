@@ -64,21 +64,19 @@ pub fn fmt_change_pct(pct: Option<f64>) -> String {
     }
 }
 
-/// Format volume for display (with commas).
+/// Format volume for display. IB TWS reports volume in round lots (100 shares).
+/// Converts to shares and formats with K/M suffix.
 pub fn fmt_volume(vol: Option<i64>) -> String {
     match vol {
         Some(v) => {
-            // Simple comma formatting
-            let s = v.to_string();
-            let bytes = s.as_bytes();
-            let mut result = String::new();
-            for (i, &b) in bytes.iter().enumerate() {
-                if i > 0 && (bytes.len() - i) % 3 == 0 {
-                    result.push(',');
-                }
-                result.push(b as char);
+            let shares = v as f64 * 100.0;
+            if shares >= 1_000_000.0 {
+                format!("{:.1}M", shares / 1_000_000.0)
+            } else if shares >= 1_000.0 {
+                format!("{:.1}K", shares / 1_000.0)
+            } else {
+                format!("{:.0}", shares)
             }
-            result
         }
         None => "-".to_string(),
     }
@@ -338,8 +336,10 @@ mod tests {
 
     #[test]
     fn test_fmt_volume() {
-        assert_eq!(fmt_volume(Some(1234567)), "1,234,567");
-        assert_eq!(fmt_volume(Some(100)), "100");
+        // IB reports in round lots (100 shares): 1234567 lots = 123,456,700 shares = 123.5M
+        assert_eq!(fmt_volume(Some(1234567)), "123.5M");
+        // 100 lots = 10,000 shares = 10.0K
+        assert_eq!(fmt_volume(Some(100)), "10.0K");
         assert_eq!(fmt_volume(None), "-");
     }
 

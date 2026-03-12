@@ -584,12 +584,16 @@ impl App {
                         sr.float_shares = ar.float_shares;
                         sr.short_pct = ar.short_pct;
                         sr.avg_volume = ar.avg_volume;
+                        sr.avg_volume_10d = ar.avg_volume_10d;
                         sr.catalyst = ar.catalyst.clone();
                         sr.news_headlines = ar.news_headlines.clone();
                         sr.enriched = true;
-                        if let (Some(vol), Some(avg)) = (sr.volume, ar.avg_volume) {
+                        // Prefer 10d avg for RVOL, fall back to 3mo
+                        let avg_for_rvol = ar.avg_volume_10d.or(ar.avg_volume);
+                        if let (Some(vol), Some(avg)) = (sr.volume, avg_for_rvol) {
                             if avg > 0 {
-                                sr.rvol = Some(vol as f64 / avg as f64);
+                                // vol is IB round lots (×100), avg is Yahoo raw shares
+                                sr.rvol = Some(vol as f64 * 100.0 / avg as f64);
                             }
                         }
                     }
@@ -760,10 +764,14 @@ impl App {
                     sr.catalyst = data.catalyst;
                     sr.news_headlines = data.news_headlines;
                     sr.avg_volume = data.avg_volume;
+                    sr.avg_volume_10d = data.avg_volume_10d;
                     sr.enriched = true;
-                    if let (Some(vol), Some(avg)) = (sr.volume, data.avg_volume) {
+                    // Prefer 10d avg for RVOL, fall back to 3mo
+                    let avg_for_rvol = data.avg_volume_10d.or(data.avg_volume);
+                    if let (Some(vol), Some(avg)) = (sr.volume, avg_for_rvol) {
                         if avg > 0 {
-                            sr.rvol = Some(vol as f64 / avg as f64);
+                            // vol is IB round lots (×100), avg is Yahoo raw shares
+                            sr.rvol = Some(vol as f64 * 100.0 / avg as f64);
                         }
                     }
                 }

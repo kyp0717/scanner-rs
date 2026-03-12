@@ -361,6 +361,58 @@ pub async fn fetch_scanner_params(host: &str, ports: &[u16], client_id: i32) -> 
     }
 }
 
+/// Fetch today's 5-min historical bars for a symbol and return (summed_volume, tick_volume, bars).
+/// Used to cross-check whether the tick Volume value matches reality.
+pub async fn fetch_volume_check(
+    symbol: &str,
+    host: &str,
+    ports: &[u16],
+) -> Result<(f64, Option<i64>, Vec<(String, f64, f64)>)> {
+    use ibapi::market_data::historical::{BarSize, ToDuration, WhatToShow};
+    use ibapi::market_data::TradingHours;
+
+    let (client, _port) = connect(host, ports, 22).await?;
+
+    let contract = ibapi::contracts::Contract::stock(symbol).build();
+
+    // Fetch 1 day of 5-min bars (includes pre-market with Extended hours)
+    let hist = client
+        .historical_data(
+            &contract,
+            None, // end_date = now
+            1.days(),
+            BarSize::Min5,
+            Some(WhatToShow::Trades),
+            TradingHours::Extended,
+        )
+        .await?;
+
+    let bars: Vec<(String, f64, f64)> = hist
+        .bars
+        .iter()
+        .map(|b| {
+            let ts = format!("{}", b.date);
+            (ts, b.close, b.volume)
+        })
+        .collect();
+
+    let bar_volume_sum: f64 = hist.bars.iter().map(|b| b.volume).sum();
+
+    // Also fetch a snapshot to get the tick Volume for comparison
+    let snap = fetch_one_snapshot(&client, symbol, "USD").await;
+    let tick_volume = snap.and_then(|s| s.volume);
+
+    info!(
+        symbol,
+        bar_volume_sum,
+        tick_volume = tick_volume.unwrap_or(-1),
+        bar_count = bars.len(),
+        "volume check"
+    );
+
+    Ok((bar_volume_sum, tick_volume, bars))
+}
+
 /// Probe TWS to find the first connectable port.
 pub async fn probe_port(host: &str, ports: &[u16]) -> Option<u16> {
     let (_client, port) = connect(host, ports, 0).await.ok()?;

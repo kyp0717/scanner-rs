@@ -128,7 +128,13 @@ pub async fn cmd_enrich(symbols: &[String]) -> Result<()> {
                 .unwrap_or("-".into())
         );
         println!(
-            "  Avg Volume:  {}",
+            "  Avg Vol 10d: {}",
+            data.avg_volume_10d
+                .map(|v| format!("{v}"))
+                .unwrap_or("-".into())
+        );
+        println!(
+            "  Avg Vol 3mo: {}",
             data.avg_volume
                 .map(|v| format!("{v}"))
                 .unwrap_or("-".into())
@@ -154,6 +160,72 @@ pub async fn cmd_enrich(symbols: &[String]) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// Cross-check volume: fetch 5-min bars from IB historical data, sum volumes,
+/// and compare with the snapshot tick Volume value.
+pub async fn cmd_volume(symbols: &[String], host: &str, port: Option<u16>) -> Result<()> {
+    if symbols.is_empty() {
+        eprintln!("Usage: scanner volume LCUT AAPL ...");
+        return Ok(());
+    }
+
+    let ports: Vec<u16> = port
+        .map(|p| vec![p])
+        .unwrap_or_else(|| DEFAULT_PORTS.to_vec());
+
+    for sym in symbols {
+        println!("=== {sym} ===");
+        match tws::fetch_volume_check(sym, host, &ports).await {
+            Ok((bar_sum, tick_vol, bars)) => {
+                println!(
+                    "  5-min bar volume sum : {:.0}  ({})",
+                    bar_sum,
+                    format_vol(bar_sum as i64)
+                );
+                match tick_vol {
+                    Some(v) => println!(
+                        "  Tick Volume (×100)   : {}  ({})",
+                        v,
+                        format_vol(v)
+                    ),
+                    None => println!("  Tick Volume (×100)   : (none)"),
+                }
+                if let Some(v) = tick_vol {
+                    if bar_sum > 0.0 {
+                        let ratio = v as f64 / bar_sum;
+                        println!("  Ratio (tick / bars)  : {ratio:.4}x");
+                    }
+                }
+                println!("  Bars: {}", bars.len());
+                // Show last 5 bars
+                let show = if bars.len() > 5 {
+                    &bars[bars.len() - 5..]
+                } else {
+                    &bars
+                };
+                for (ts, close, vol) in show {
+                    println!("    {ts}  close={close:.2}  vol={vol:.0}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  Error: {e}");
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn format_vol(v: i64) -> String {
+    let shares = v as f64 * 100.0;
+    if shares >= 1_000_000.0 {
+        format!("{:.1}M", shares / 1_000_000.0)
+    } else if shares >= 1_000.0 {
+        format!("{:.1}K", shares / 1_000.0)
+    } else {
+        format!("{:.0}", shares)
+    }
 }
 
 /// Format a Unix epoch timestamp as a relative "time ago" string.

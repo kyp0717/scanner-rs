@@ -72,6 +72,17 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Cross-check volume: compare tick volume vs summed 5-min bar volume
+    Volume {
+        /// Symbols to check
+        symbols: Vec<String>,
+        /// TWS host
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TWS port
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Stream momentum alerts to stdout (headless mode)
     Alert {
         /// TWS host
@@ -161,6 +172,14 @@ async fn run_command(cmd: Commands) -> Result<()> {
 
         Commands::Config { what: _ } => {
             cli::cmd_config();
+        }
+
+        Commands::Volume {
+            symbols,
+            host,
+            port,
+        } => {
+            cli::cmd_volume(&symbols, &host, port).await?;
         }
 
         Commands::Gui { .. } | Commands::Alert { .. } => unreachable!(),

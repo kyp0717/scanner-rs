@@ -235,9 +235,33 @@ Client ID 20. **Note:** Snapshots return no data when market is closed.
 **Poll cycles** (`alert` / `gui`): No snapshots. Instead, discovered symbols
 are subscribed to **streaming market data** via `spawn_market_data_worker`
 (client ID 30). Each symbol gets an async task that calls
-`client.market_data(&contract).subscribe().await` for continuous price ticks.
-The streaming worker forwards `MarketDataTick` messages to the engine via mpsc,
-giving sub-second price updates. Poll interval is 15 seconds for discovery.
+`client.market_data(&contract).generic_ticks(&["233"]).subscribe().await`
+for continuous price/volume ticks. The streaming worker forwards
+`MarketDataTick` messages to the engine via mpsc. Poll interval is 15 seconds
+for discovery.
+
+### TWS Volume Units
+IB TWS volume values are in **round lots (100 shares per lot)** — NOT raw shares.
+Yahoo Finance avg_volume is in raw shares. This means:
+
+- **Display**: multiply IB volume by 100 to get shares (`vol * 100`).
+  `format_volume()` does this internally before applying K/M labels.
+- **RVOL**: `vol_lots * 100 / avg_shares` — must account for the unit difference.
+- Confirmed: ATPC showed 72,030 lots × 100 = 7.2M shares (matching broker display).
+
+### TWS Streaming Volume (IMPORTANT)
+The standard `TickSize` with `TickType::Volume` (type 8) **rarely updates** in
+streaming mode — IB only sends it sporadically. For live volume updates, you
+**must** request generic tick `"233"` (RTVolume). RTVolume arrives as a
+`TickString` with format: `"price;size;time;totalVolume;vwap;singleTrade"`.
+Parse field index 3 (`totalVolume`) for cumulative daily volume.
+
+Without RTVolume, price will update but volume will appear frozen.
+
+### Volume Cross-Check CLI
+```bash
+cargo run -- volume LCUT AAPL   # Compare 5-min bar sum vs tick volume
+```
 
 ## Yahoo Finance API (IMPORTANT)
 Yahoo Finance API **requires** cookie + crumb authentication on every request.
