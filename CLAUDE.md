@@ -167,7 +167,7 @@ poll clear              Clear seen-set (re-alert)
 history                 Show today's tracked stocks
 history all             Show all historical stocks
 history clear           Clear entire history
-set <key> <value>       Change setting (port, host, rows, minprice, maxprice)
+set <key> <value>       Change setting (port, host, rows, minprice, maxprice, maxstreaming)
 show                    Current settings
 aliases                 Alias map
 help                    Help text
@@ -239,6 +239,29 @@ are subscribed to **streaming market data** via `spawn_market_data_worker`
 for continuous price/volume ticks. The streaming worker forwards
 `MarketDataTick` messages to the engine via mpsc. Poll interval is 15 seconds
 for discovery.
+
+### Streaming Market Data Limit (IMPORTANT)
+TWS paper accounts have a **100 simultaneous market data lines** limit (no
+Booster Pack). The engine caps streaming subscriptions via the `max_streaming`
+setting (default **90**, leaving headroom for snapshot requests). Live accounts
+typically have higher limits — raise it with `set maxstreaming 250` (or whatever
+your account supports).
+
+When the cap is reached, **priority-based eviction** kicks in:
+
+- Each symbol is scored: `scanner_hits + 3` if catalyst confirmed
+- New symbol arrives at cap → find lowest-priority streaming symbol
+- If new symbol outranks it → cancel the victim's subscription, subscribe new one
+- If not → skip the new symbol (warning logged)
+
+Cancellation uses `tokio::sync::oneshot` per symbol — the worker task receives
+the cancel signal via `tokio::select!` and calls `subscription.cancel().await`
+to properly release the TWS data line. Evicted symbols keep their last-known
+data in the alert table but stop receiving live updates.
+
+Poll scans do **not** fetch snapshots — streaming provides all price data.
+One-shot scans (`cargo run -- scan`) still use snapshots (client ID 20, chunks
+of 10), which also count toward the TWS limit.
 
 ### TWS Volume Units
 IB TWS volume values are in **round lots (100 shares per lot)** — NOT raw shares.

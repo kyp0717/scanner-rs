@@ -444,7 +444,7 @@ impl App {
     fn cmd_set(&mut self, args: &[&str]) {
         if args.len() < 2 {
             self.push_output("Usage: set <key> <value>");
-            self.push_output("Keys: port, host, rows, minprice, maxprice");
+            self.push_output("Keys: port, host, rows, minprice, maxprice, maxstreaming");
             return;
         }
 
@@ -468,6 +468,10 @@ impl App {
                 } else {
                     val.parse().ok()
                 };
+            }
+            "maxstreaming" => {
+                self.engine.settings.max_streaming =
+                    val.parse().unwrap_or(self.engine.settings.max_streaming);
             }
             _ => {
                 self.push_output(&format!("Unknown setting: {key}"));
@@ -512,6 +516,10 @@ impl App {
                 .max_price
                 .map(|p| p.to_string())
                 .unwrap_or("none".to_string())
+        ));
+        self.push_output(&format!(
+            "  maxstreaming = {}",
+            self.engine.settings.max_streaming
         ));
     }
 

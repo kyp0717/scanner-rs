@@ -96,7 +96,14 @@ pub struct Settings {
     pub rows: u32,
     pub min_price: Option<f64>,
     pub max_price: Option<f64>,
+    /// Max concurrent streaming market data subscriptions.
+    /// TWS paper accounts: 90 (100-line limit minus headroom).
+    /// Live accounts: raise based on your market data subscription.
+    pub max_streaming: usize,
 }
+
+/// Default max streaming subscriptions (safe for TWS paper accounts).
+pub const DEFAULT_MAX_STREAMING: usize = 90;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -106,6 +113,7 @@ impl Default for Settings {
             rows: 25,
             min_price: Some(1.0),
             max_price: None,
+            max_streaming: DEFAULT_MAX_STREAMING,
         }
     }
 }

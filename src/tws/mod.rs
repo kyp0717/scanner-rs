@@ -203,10 +203,9 @@ pub async fn run_poll_scan(
         }
     }
 
-    // Fetch snapshots for initial prices (streaming updates them later)
-    if !symbol_data.is_empty() {
-        fetch_snapshots(&mut symbol_data, host, ports, 50, 21).await;
-    }
+    // NOTE: No snapshot fetch here — streaming market data (client ID 30)
+    // provides live prices for all poll-discovered symbols. Snapshots would
+    // compete for TWS's 100-line market data limit.
 
     (symbol_scanners, symbol_data, Some(port))
 }

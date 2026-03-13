@@ -95,11 +95,13 @@ pub enum EngineEvent {
     },
 }
 
-/// Request to subscribe to streaming market data for a symbol.
+/// Request to the market data worker.
 #[derive(Debug, Clone)]
 pub struct MktDataRequest {
     pub symbol: String,
     pub currency: String,
+    /// If true, cancel the subscription for this symbol instead of subscribing.
+    pub cancel: bool,
 }
 
 /// Core alert engine — business logic shared by GUI and CLI.
@@ -143,18 +145,69 @@ impl AlertEngine {
         }
     }
 
+    /// Compute a priority score for a symbol based on its alert row data.
+    /// Higher = more important to keep streaming.
+    fn streaming_priority(&self, symbol: &str) -> u32 {
+        if let Some(row) = self.alert_rows.iter().find(|r| r.symbol == symbol) {
+            let mut score = row.scanner_hits;
+            if row.catalyst.is_some() {
+                score += 3;
+            }
+            score
+        } else {
+            0
+        }
+    }
+
     /// Subscribe a symbol to streaming market data (if not already subscribed).
+    /// If at the cap, evicts the lowest-priority subscription to make room.
     pub fn subscribe_market_data(&mut self, symbol: &str, currency: &str) {
         if self.streaming_set.contains(symbol) {
             return;
         }
-        if let Some(ref tx) = self.mktdata_tx {
-            let _ = tx.send(MktDataRequest {
-                symbol: symbol.to_string(),
-                currency: currency.to_string(),
-            });
-            self.streaming_set.insert(symbol.to_string());
+        let tx = match self.mktdata_tx {
+            Some(ref tx) => tx,
+            None => return,
+        };
+
+        let max = self.settings.max_streaming;
+
+        // Evict lowest-priority symbol if at cap
+        if self.streaming_set.len() >= max {
+            let new_priority = self.streaming_priority(symbol);
+            // Find the lowest-priority currently-streaming symbol
+            let victim = self
+                .streaming_set
+                .iter()
+                .map(|s| (s.clone(), self.streaming_priority(s)))
+                .min_by_key(|(_, p)| *p);
+            if let Some((victim_sym, victim_priority)) = victim {
+                if new_priority <= victim_priority {
+                    // New symbol isn't higher priority — skip it
+                    warn!(symbol = %symbol, "streaming limit reached ({}/{}), skipping (priority {})",
+                        self.streaming_set.len(), max, new_priority);
+                    return;
+                }
+                // Evict the victim
+                info!(evicted = %victim_sym, evicted_priority = victim_priority,
+                    new_symbol = %symbol, new_priority, "evicting streaming subscription");
+                let _ = tx.send(MktDataRequest {
+                    symbol: victim_sym.clone(),
+                    currency: String::new(),
+                    cancel: true,
+                });
+                self.streaming_set.remove(&victim_sym);
+            } else {
+                return;
+            }
         }
+
+        let _ = tx.send(MktDataRequest {
+            symbol: symbol.to_string(),
+            currency: currency.to_string(),
+            cancel: false,
+        });
+        self.streaming_set.insert(symbol.to_string());
     }
 
     /// Queue enrichment for a symbol if the channel is available.
@@ -252,6 +305,7 @@ impl AlertEngine {
             let _ = tx.send(MktDataRequest {
                 symbol: String::new(),
                 currency: String::new(),
+                cancel: false,
             });
         }
         count
@@ -863,6 +917,8 @@ pub fn spawn_market_data_worker(
             };
 
             let mut subscribed: HashSet<String> = HashSet::new();
+            // Cancel senders keyed by symbol — drop the sender to signal task cancellation.
+            let mut cancel_txs: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
 
             loop {
                 // Drain new subscription requests
@@ -870,15 +926,30 @@ pub fn spawn_market_data_worker(
                     match mktdata_rx.try_recv() {
                         Ok(req) => {
                             if req.symbol.is_empty() {
-                                // Sentinel: clear tracked set (tasks will end naturally
-                                // when their subscriptions are cancelled by TWS)
+                                // Sentinel: cancel all subscriptions
+                                for (sym, cancel_tx) in cancel_txs.drain() {
+                                    let _ = cancel_tx.send(());
+                                    info!(symbol = %sym, "cancelled streaming (clear all)");
+                                }
                                 subscribed.clear();
+                                continue;
+                            }
+                            if req.cancel {
+                                // Cancel a specific subscription
+                                if let Some(cancel_tx) = cancel_txs.remove(&req.symbol) {
+                                    let _ = cancel_tx.send(());
+                                    info!(symbol = %req.symbol, "cancelled streaming (evicted)");
+                                }
+                                subscribed.remove(&req.symbol);
                                 continue;
                             }
                             if subscribed.contains(&req.symbol) {
                                 continue;
                             }
                             subscribed.insert(req.symbol.clone());
+
+                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                            cancel_txs.insert(req.symbol.clone(), cancel_tx);
 
                             // Spawn an async task per symbol to stream ticks
                             let client = Arc::clone(&client);
@@ -908,77 +979,87 @@ pub fn spawn_market_data_worker(
 
                                 info!(symbol = %symbol, "streaming market data subscribed");
                                 let mut stored_close: Option<f64> = None;
+                                let mut cancel_rx = cancel_rx;
 
-                                while let Some(result) = subscription.next().await {
-                                    let tick = match result {
-                                        Ok(t) => t,
-                                        Err(_) => break,
-                                    };
-
-                                    let mut last = None;
-                                    let mut close = None;
-                                    let mut bid = None;
-                                    let mut ask = None;
-                                    let mut volume = None;
-
-                                    match tick {
-                                        TickTypes::Price(tp) => match tp.tick_type {
-                                            ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
-                                            ibapi::contracts::tick_types::TickType::Close => {
-                                                close = Some(tp.price);
-                                                stored_close = close;
-                                            }
-                                            ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
-                                            ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
-                                            _ => continue,
-                                        },
-                                        TickTypes::PriceSize(tp) => {
-                                            match tp.price_tick_type {
-                                                ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
-                                                ibapi::contracts::tick_types::TickType::Close => {
-                                                    close = Some(tp.price);
-                                                    stored_close = close;
-                                                }
-                                                ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
-                                                ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
-                                                _ => {}
-                                            }
-                                            if tp.size_tick_type == ibapi::contracts::tick_types::TickType::Volume {
-                                                volume = Some(tp.size as i64);
-                                            }
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut cancel_rx => {
+                                            subscription.cancel().await;
+                                            info!(symbol = %symbol, "streaming market data cancelled");
+                                            break;
                                         }
-                                        TickTypes::Size(ts) => {
-                                            if ts.tick_type == ibapi::contracts::tick_types::TickType::Volume {
-                                                volume = Some(ts.size as i64);
-                                            } else {
-                                                continue;
-                                            }
-                                        }
-                                        // RTVolume (tick 233): "price;size;time;totalVolume;vwap;single"
-                                        TickTypes::String(ts) if ts.tick_type == ibapi::contracts::tick_types::TickType::RtVolume => {
-                                            let parts: Vec<&str> = ts.value.split(';').collect();
-                                            if parts.len() >= 4 {
-                                                if let Ok(tv) = parts[3].parse::<f64>() {
-                                                    volume = Some(tv as i64);
-                                                }
-                                                if let Ok(p) = parts[0].parse::<f64>() {
-                                                    if p > 0.0 {
-                                                        last = Some(p);
+                                        tick_opt = subscription.next() => {
+                                            let tick = match tick_opt {
+                                                Some(Ok(t)) => t,
+                                                _ => break,
+                                            };
+
+                                            let mut last = None;
+                                            let mut close = None;
+                                            let mut bid = None;
+                                            let mut ask = None;
+                                            let mut volume = None;
+
+                                            match tick {
+                                                TickTypes::Price(tp) => match tp.tick_type {
+                                                    ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
+                                                    ibapi::contracts::tick_types::TickType::Close => {
+                                                        close = Some(tp.price);
+                                                        stored_close = close;
+                                                    }
+                                                    ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
+                                                    ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
+                                                    _ => continue,
+                                                },
+                                                TickTypes::PriceSize(tp) => {
+                                                    match tp.price_tick_type {
+                                                        ibapi::contracts::tick_types::TickType::Last => last = Some(tp.price),
+                                                        ibapi::contracts::tick_types::TickType::Close => {
+                                                            close = Some(tp.price);
+                                                            stored_close = close;
+                                                        }
+                                                        ibapi::contracts::tick_types::TickType::Bid => bid = Some(tp.price),
+                                                        ibapi::contracts::tick_types::TickType::Ask => ask = Some(tp.price),
+                                                        _ => {}
+                                                    }
+                                                    if tp.size_tick_type == ibapi::contracts::tick_types::TickType::Volume {
+                                                        volume = Some(tp.size as i64);
                                                     }
                                                 }
+                                                TickTypes::Size(ts) => {
+                                                    if ts.tick_type == ibapi::contracts::tick_types::TickType::Volume {
+                                                        volume = Some(ts.size as i64);
+                                                    } else {
+                                                        continue;
+                                                    }
+                                                }
+                                                // RTVolume (tick 233): "price;size;time;totalVolume;vwap;single"
+                                                TickTypes::String(ts) if ts.tick_type == ibapi::contracts::tick_types::TickType::RtVolume => {
+                                                    let parts: Vec<&str> = ts.value.split(';').collect();
+                                                    if parts.len() >= 4 {
+                                                        if let Ok(tv) = parts[3].parse::<f64>() {
+                                                            volume = Some(tv as i64);
+                                                        }
+                                                        if let Ok(p) = parts[0].parse::<f64>() {
+                                                            if p > 0.0 {
+                                                                last = Some(p);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ => continue,
                                             }
-                                        }
-                                        _ => continue,
-                                    }
 
-                                    let _ = tx.send(BgMessage::MarketDataTick {
-                                        symbol: symbol.clone(),
-                                        last,
-                                        close: close.or(stored_close),
-                                        bid,
-                                        ask,
-                                        volume,
-                                    });
+                                            let _ = tx.send(BgMessage::MarketDataTick {
+                                                symbol: symbol.clone(),
+                                                last,
+                                                close: close.or(stored_close),
+                                                bid,
+                                                ask,
+                                                volume,
+                                            });
+                                        }
+                                    }
                                 }
                             });
                         }
@@ -1089,5 +1170,166 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let events = engine.tick(rt.handle());
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_priority() {
+        let (tx, _rx) = mpsc::channel();
+        let mut engine = AlertEngine::new(tx, Settings::default(), None);
+
+        // Unknown symbol gets 0
+        assert_eq!(engine.streaming_priority("UNKNOWN"), 0);
+
+        // Symbol with scanner_hits but no catalyst
+        engine.alert_rows.push(AlertRow {
+            symbol: "AAPL".to_string(),
+            alert_time: "10:00:00".to_string(),
+            last: Some(150.0),
+            change_pct: Some(5.0),
+            volume: None,
+            rvol: None,
+            float_shares: None,
+            short_pct: None,
+            name: None,
+            sector: None,
+            industry: None,
+            country: None,
+            catalyst: None,
+            catalyst_time: None,
+            scanner_hits: 4,
+            scanners: vec![],
+            news_headlines: Vec::new(),
+            enriched: false,
+            avg_volume: None,
+            avg_volume_10d: None,
+        });
+        assert_eq!(engine.streaming_priority("AAPL"), 4);
+
+        // Symbol with catalyst gets +3
+        engine.alert_rows.push(AlertRow {
+            symbol: "TSLA".to_string(),
+            alert_time: "10:00:00".to_string(),
+            last: Some(200.0),
+            change_pct: Some(12.0),
+            volume: None,
+            rvol: None,
+            float_shares: None,
+            short_pct: None,
+            name: None,
+            sector: None,
+            industry: None,
+            country: None,
+            catalyst: Some("Earnings".to_string()),
+            catalyst_time: None,
+            scanner_hits: 2,
+            scanners: vec![],
+            news_headlines: Vec::new(),
+            enriched: false,
+            avg_volume: None,
+            avg_volume_10d: None,
+        });
+        assert_eq!(engine.streaming_priority("TSLA"), 5); // 2 + 3
+    }
+
+    #[test]
+    fn test_streaming_cap_and_eviction() {
+        let (enrich_tx, _enrich_rx) = mpsc::channel();
+        let mut engine = AlertEngine::new(enrich_tx, Settings::default(), None);
+
+        // Set up mktdata channel so subscribe_market_data actually works
+        let (mktdata_tx, mktdata_rx) = mpsc::channel();
+        engine.mktdata_tx = Some(mktdata_tx);
+
+        // Fill to cap with low-priority symbols
+        for i in 0..DEFAULT_MAX_STREAMING {
+            let sym = format!("SYM{i}");
+            engine.alert_rows.push(AlertRow {
+                symbol: sym.clone(),
+                alert_time: "10:00:00".to_string(),
+                last: Some(5.0),
+                change_pct: Some(1.0),
+                volume: None,
+                rvol: None,
+                float_shares: None,
+                short_pct: None,
+                name: None,
+                sector: None,
+                industry: None,
+                country: None,
+                catalyst: None,
+                catalyst_time: None,
+                scanner_hits: 1,
+                scanners: vec![],
+                news_headlines: Vec::new(),
+                enriched: false,
+                avg_volume: None,
+                avg_volume_10d: None,
+            });
+            engine.subscribe_market_data(&sym, "USD");
+        }
+        assert_eq!(engine.streaming_set.len(), DEFAULT_MAX_STREAMING);
+
+        // Try to add a low-priority symbol — should be rejected
+        engine.alert_rows.push(AlertRow {
+            symbol: "LOWPRI".to_string(),
+            alert_time: "10:00:00".to_string(),
+            last: Some(5.0),
+            change_pct: Some(1.0),
+            volume: None,
+            rvol: None,
+            float_shares: None,
+            short_pct: None,
+            name: None,
+            sector: None,
+            industry: None,
+            country: None,
+            catalyst: None,
+            catalyst_time: None,
+            scanner_hits: 1,
+            scanners: vec![],
+            news_headlines: Vec::new(),
+            enriched: false,
+            avg_volume: None,
+            avg_volume_10d: None,
+        });
+        engine.subscribe_market_data("LOWPRI", "USD");
+        assert!(!engine.streaming_set.contains("LOWPRI"));
+        assert_eq!(engine.streaming_set.len(), DEFAULT_MAX_STREAMING);
+
+        // Add a high-priority symbol — should evict one of the low-priority ones
+        engine.alert_rows.push(AlertRow {
+            symbol: "HIGHPRI".to_string(),
+            alert_time: "10:00:00".to_string(),
+            last: Some(5.0),
+            change_pct: Some(20.0),
+            volume: None,
+            rvol: None,
+            float_shares: None,
+            short_pct: None,
+            name: None,
+            sector: None,
+            industry: None,
+            country: None,
+            catalyst: Some("FDA".to_string()),
+            catalyst_time: None,
+            scanner_hits: 6,
+            scanners: vec![],
+            news_headlines: Vec::new(),
+            enriched: false,
+            avg_volume: None,
+            avg_volume_10d: None,
+        });
+        engine.subscribe_market_data("HIGHPRI", "USD");
+        assert!(engine.streaming_set.contains("HIGHPRI"));
+        assert_eq!(engine.streaming_set.len(), DEFAULT_MAX_STREAMING);
+
+        // Drain mktdata channel and verify a cancel was sent
+        let mut found_cancel = false;
+        while let Ok(req) = mktdata_rx.try_recv() {
+            if req.cancel {
+                found_cancel = true;
+            }
+        }
+        assert!(found_cancel, "should have sent a cancel request for evicted symbol");
     }
 }
